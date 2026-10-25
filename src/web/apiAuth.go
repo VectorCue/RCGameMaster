@@ -14,7 +14,6 @@ import (
 	"log/slog"
 	"net/http"
 	"net/url"
-	"slices"
 	"strings"
 	"sync"
 	"time"
@@ -66,6 +65,14 @@ type Auth struct {
 }
 
 func NewAuth(cfg config.AuthConfig) (*Auth, error) {
+	// Copy/pasted identifiers and URLs may include surrounding whitespace.
+	// Normalize these settings once; the client secret must remain exact.
+	cfg.FusionAuthURL = strings.TrimSpace(cfg.FusionAuthURL)
+	cfg.FusionAuthClientId = strings.TrimSpace(cfg.FusionAuthClientId)
+	cfg.FusionAuthTenantId = strings.TrimSpace(cfg.FusionAuthTenantId)
+	cfg.OAuthRedirectURI = strings.TrimSpace(cfg.OAuthRedirectURI)
+	cfg.FrontendURL = strings.TrimSpace(cfg.FrontendURL)
+	cfg.RequiredRole = strings.TrimSpace(cfg.RequiredRole)
 	if cfg.DisableFusionAuth {
 		if cfg.FrontendURL == "" {
 			cfg.FrontendURL = "http://localhost:2005/#/"
@@ -197,6 +204,7 @@ func (a *Auth) post(ctx context.Context, path string, form url.Values, result an
 	}
 	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
 	req.Header.Set("Accept", "application/json")
+	req.Header.Set("X-FusionAuth-TenantId", a.cfg.FusionAuthTenantId)
 	res, err := a.client.Do(req)
 	if err != nil {
 		logger.WarnContext(ctx, "auth.provider_failed", "reason", providerErrorKind(err), "duration_ms", time.Since(start).Milliseconds())
@@ -241,12 +249,12 @@ func (a *Auth) inspect(ctx context.Context, token string) (User, time.Time, erro
 		return User{}, time.Time{}, err
 	}
 	if !claims.Active || claims.ApplicationID != a.cfg.FusionAuthClientId || claims.TenantID != a.cfg.FusionAuthTenantId || claims.Subject == "" || claims.Exp <= time.Now().Unix() ||
-		(a.cfg.RequiredRole != "" && !slices.Contains(claims.Roles, a.cfg.RequiredRole)) {
+		(a.cfg.RequiredRole != "" && !hasRole(User{Roles: claims.Roles}, a.cfg.RequiredRole)) {
 		requestLogger(ctx).WarnContext(ctx, "auth.claims_rejected",
 			"active", claims.Active, "application_matches", claims.ApplicationID == a.cfg.FusionAuthClientId,
 			"tenant_matches", claims.TenantID == a.cfg.FusionAuthTenantId, "subject_present", claims.Subject != "",
 			"expired", claims.Exp <= time.Now().Unix(),
-			"required_role_present", a.cfg.RequiredRole == "" || slices.Contains(claims.Roles, a.cfg.RequiredRole))
+			"required_role_present", a.cfg.RequiredRole == "" || hasRole(User{Roles: claims.Roles}, a.cfg.RequiredRole))
 		return User{}, time.Time{}, errUnauthorized
 	}
 	return User{ID: claims.Subject, Email: claims.Email, Username: claims.Username, Roles: claims.Roles}, time.Unix(claims.Exp, 0), nil

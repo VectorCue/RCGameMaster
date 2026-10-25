@@ -1,0 +1,24 @@
+[logging]
+level = "info"
+
+[database]
+host = "127.0.0.1"
+port = 5432
+user = "rcjv"
+password = "replace-me"
+database = "rcjv_gamemaster"
+timezone = "Europe/Berlin"
+sslmode = "disable"
+
+[auth]
+# This bypass grants administrator access and binds the server to loopback.
+# Use only for local development. Keep false for shared installations.
+disable_fusionauth = false
+fusionauth_url = "https://auth.example.org"
+fusionauth_client_id = "replace-with-application-id"
+fusionauth_client_secret = "replace-with-client-secret"
+fusionauth_tenant_id = "replace-with-tenant-id"
+oauth_redirect_uri = "http://localhost:2006/auth/callback"
+frontend_url = "http://localhost:2006/#/"
+# Optional additional FusionAuth registration role required for sign-in.
+required_role = ""

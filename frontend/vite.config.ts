@@ -17,4 +17,15 @@ export default defineConfig({
       '@': fileURLToPath(new URL('./src', import.meta.url)),
     },
   },
+  server: {
+    host: '127.0.0.1',
+    port: 2005,
+    strictPort: true,
+    proxy: {
+      '/api': 'http://127.0.0.1:2006',
+      '/auth': 'http://127.0.0.1:2006',
+      '/rest': 'http://127.0.0.1:2006',
+      '/healthcheck': 'http://127.0.0.1:2006',
+    },
+  },
 })

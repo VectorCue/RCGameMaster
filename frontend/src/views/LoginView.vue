@@ -28,11 +28,11 @@
   
   <template>
     <section class="login-card" aria-labelledby="login-title">
-      <p class="eyebrow">Technulgy Admin Software</p>
-      <h1 id="login-title">Sign in to T.A.S.</h1>
+      <p class="eyebrow">RCJV Game Master</p>
+      <h1 id="login-title">Ready for the next match.</h1>
       <p>Use your authorized team account to continue.</p>
       <p v-if="error" class="error" role="alert">{{ error }}</p>
-      <button :disabled="checking" @click="login(route.query.returnTo)">
+      <button class="button primary" :disabled="checking" @click="login(route.query.returnTo)">
         {{ checking ? 'Checking your session…' : 'Sign in with FusionAuth' }}
       </button>
       <p class="hint">Access is limited to registered team members.</p>

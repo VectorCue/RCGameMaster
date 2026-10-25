@@ -12,13 +12,21 @@ async function recheckSession() {
   if (route.meta.public || document.hidden || checking) return
   checking = true
   try {
-    if (!await checkSession()) await router.replace({ name: 'login', query: { returnTo: route.fullPath } })
+    if (!(await checkSession()))
+      await router.replace({ name: 'login', query: { returnTo: route.fullPath } })
+  } catch {
+    await router.replace({
+      name: 'login',
+      query: { error: 'unavailable', returnTo: route.fullPath },
+    })
+  } finally {
+    checking = false
   }
-  catch { await router.replace({ name: 'login', query: { error: 'unavailable', returnTo: route.fullPath } }) }
-  finally { checking = false }
 }
 onMounted(() => {
-  timer = setInterval(() => { void recheckSession() }, 60_000)
+  timer = setInterval(() => {
+    void recheckSession()
+  }, 60_000)
   window.addEventListener('focus', recheckSession)
 })
 onUnmounted(() => {
@@ -28,6 +36,8 @@ onUnmounted(() => {
 </script>
 
 <template>
-  <main v-if="route.meta.public" class="auth-main"><RouterView /></main>
+  <main v-if="route.meta.public" :class="route.name === 'login' ? 'auth-main' : 'public-main'">
+    <RouterView />
+  </main>
   <AppShell v-else><RouterView /></AppShell>
 </template>

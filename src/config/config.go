@@ -9,15 +9,15 @@ import (
 
 type Config struct {
 	Logging struct {
-			Level string `toml:"level"`
-		} `toml:"logging"`
+		Level string `toml:"level"`
+	} `toml:"logging"`
 	Database struct {
 		Host     string `toml:"host"`
 		Port     int    `toml:"port"`
 		User     string `toml:"user"`
 		Password string `toml:"password"`
 		Database string `toml:"database"`
-		TimeZone string `toml:"timezone"`
+		SSLMode  string `toml:"sslmode"`
 	} `toml:"database"`
 
 	Auth AuthConfig `toml:"auth"`
@@ -37,7 +37,11 @@ type AuthConfig struct {
 func GetConfig() *Config {
 	var cfg Config
 
-	bytes, err := os.ReadFile("config.toml")
+	path := os.Getenv("RCJV_CONFIG")
+	if path == "" {
+		path = "config.toml"
+	}
+	bytes, err := os.ReadFile(path)
 	if err != nil {
 		log.Fatalf("Error opening config file: %v\n", err)
 	}
