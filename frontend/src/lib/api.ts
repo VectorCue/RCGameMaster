@@ -35,21 +35,35 @@ export const canAdmin = computed(() => hasRole('admin'))
 export const canEdit = computed(() => hasRole('admin', 'editor'))
 export const canReferee = computed(() => hasRole('admin', 'editor', 'referee'))
 export const tournaments = ref<Tournament[]>([])
-export const activeTournamentId = ref<number | null>(
-  Number(localStorage.getItem('activeTournament')) || null,
-)
+function storedTournamentId(): number | null {
+  try {
+    const id = Number(localStorage.getItem('activeTournament'))
+    return Number.isSafeInteger(id) && id > 0 ? id : null
+  } catch {
+    return null
+  }
+}
+function storeTournamentId(id: number | null) {
+  try {
+    if (id === null) localStorage.removeItem('activeTournament')
+    else localStorage.setItem('activeTournament', String(id))
+  } catch {
+    // Keep the current workspace usable when browser storage is unavailable.
+  }
+}
+export const activeTournamentId = ref<number | null>(storedTournamentId())
 export const activeTournament = computed(() =>
   tournaments.value.find((t) => t.id === activeTournamentId.value),
 )
 export function selectTournament(id: number) {
   activeTournamentId.value = id
-  localStorage.setItem('activeTournament', String(id))
+  storeTournamentId(id)
 }
 export async function loadTournaments() {
   tournaments.value = (await api.get<Tournament[]>('/tournaments')).data
   if (!tournaments.value.length) {
     activeTournamentId.value = null
-    localStorage.removeItem('activeTournament')
+    storeTournamentId(null)
   }
   if (!tournaments.value.some((t) => t.id === activeTournamentId.value) && tournaments.value[0])
     selectTournament(tournaments.value[0].id)

@@ -7,9 +7,7 @@ import type { Tournament, Workspace } from '@/lib/types'
 
 const route = useRoute()
 const tournaments = ref<Tournament[]>([])
-const selected = ref(
-  Number(route.query.tournament) || Number(localStorage.getItem('activeTournament')) || 0,
-)
+const selected = ref(Number(route.query.tournament) || activeTournamentId.value || 0)
 const field = ref<number | ''>('')
 const workspace = ref<Workspace | null>(null)
 const loading = ref(true)
@@ -40,6 +38,7 @@ const matches = computed(() =>
   (workspace.value?.matches ?? [])
     .filter(
       (m) =>
+        !m.is_placeholder &&
         eligibleLeagues.value.has(m.league_id) &&
         (field.value === '' || m.field_id === field.value) &&
         !['approved'].includes(m.status) &&

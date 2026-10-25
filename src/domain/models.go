@@ -16,22 +16,23 @@ type Tournament struct {
 	UpdatedAt time.Time `json:"updated_at"`
 }
 type League struct {
-	ID                 uint    `json:"id" gorm:"primaryKey"`
-	TournamentID       uint    `json:"tournament_id" gorm:"index;uniqueIndex:league_abbrev"`
-	ParentID           *uint   `json:"parent_id" gorm:"index"`
-	Name               string  `json:"name"`
-	Abbrev             string  `json:"abbrev" gorm:"uniqueIndex:league_abbrev"`
-	Mode               string  `json:"mode"`
-	RefereeMode        bool    `json:"referee_mode"`
-	InspectionsEnabled *bool   `json:"inspections_enabled" gorm:"not null;default:true"`
-	RobotCount         int     `json:"robot_count"`
-	MaxWeightG         float64 `json:"max_weight_g"`
-	BallZoneCM         float64 `json:"ball_zone_cm"`
-	Voltage            float64 `json:"voltage"`
-	SizeCM             float64 `json:"size_cm"`
-	MotorLimit         int     `json:"motor_limit"`
-	HalfSeconds        int     `json:"half_seconds"`
-	HalftimeSeconds    int     `json:"halftime_seconds"`
+	StandingsAutoPublish *bool   `json:"standings_auto_publish" gorm:"not null;default:true"`
+	ID                   uint    `json:"id" gorm:"primaryKey"`
+	TournamentID         uint    `json:"tournament_id" gorm:"index;uniqueIndex:league_abbrev"`
+	ParentID             *uint   `json:"parent_id" gorm:"index"`
+	Name                 string  `json:"name"`
+	Abbrev               string  `json:"abbrev" gorm:"uniqueIndex:league_abbrev"`
+	Mode                 string  `json:"mode"`
+	RefereeMode          bool    `json:"referee_mode"`
+	InspectionsEnabled   *bool   `json:"inspections_enabled" gorm:"not null;default:true"`
+	RobotCount           int     `json:"robot_count"`
+	MaxWeightG           float64 `json:"max_weight_g"`
+	BallZoneCM           float64 `json:"ball_zone_cm"`
+	Voltage              float64 `json:"voltage"`
+	SizeCM               float64 `json:"size_cm"`
+	MotorLimit           int     `json:"motor_limit"`
+	HalfSeconds          int     `json:"half_seconds"`
+	HalftimeSeconds      int     `json:"halftime_seconds"`
 }
 
 // InspectionsRequired treats old fixtures and omitted configuration as enabled.
@@ -39,7 +40,23 @@ func (l League) InspectionsRequired() bool {
 	return l.InspectionsEnabled == nil || *l.InspectionsEnabled
 }
 
+func (l League) AutoPublishStandings() bool {
+	return l.StandingsAutoPublish == nil || *l.StandingsAutoPublish
+}
+
+type StandingPublication struct {
+	SourceMatchIDs []uint     `json:"-" gorm:"serializer:json;type:text"`
+	ID             uint       `json:"-" gorm:"primaryKey"`
+	TournamentID   uint       `json:"-" gorm:"index"`
+	LeagueID       uint       `json:"league_id" gorm:"index"`
+	StageID        uint       `json:"stage_id" gorm:"uniqueIndex"`
+	PublishedAt    time.Time  `json:"published_at"`
+	Rows           []Standing `json:"rows" gorm:"serializer:json;type:text"`
+}
+
 type Stage struct {
+	ExpectedTeams int    `json:"expected_teams"`
+	PreparedTeams int    `json:"-" gorm:"not null;default:0"`
 	TeamLimit     int    `json:"team_limit"`
 	ID            uint   `json:"id" gorm:"primaryKey"`
 	TournamentID  uint   `json:"tournament_id" gorm:"index"`
@@ -81,6 +98,7 @@ type Referee struct {
 	AvailableUntil *time.Time `json:"available_until"`
 }
 type Match struct {
+	IsPlaceholder   bool            `json:"is_placeholder" gorm:"not null;default:false"`
 	IsBye           bool            `json:"is_bye"`
 	ID              uint            `json:"id" gorm:"primaryKey"`
 	TournamentID    uint            `json:"tournament_id" gorm:"index;uniqueIndex:match_number"`
@@ -119,17 +137,19 @@ type Standing struct {
 	Rank       int  `json:"rank"`
 }
 type Workspace struct {
-	Tournament Tournament `json:"tournament"`
-	Leagues    []League   `json:"leagues"`
-	Stages     []Stage    `json:"stages"`
-	Fields     []Field    `json:"fields"`
-	Slots      []Slot     `json:"slots"`
-	Teams      []Team     `json:"teams"`
-	Referees   []Referee  `json:"referees"`
-	Matches    []Match    `json:"matches"`
-	Standings  []Standing `json:"standings"`
+	PublishedStandings []StandingPublication `json:"published_standings"`
+	StandingHistory    []StandingPublication `json:"-"`
+	Tournament         Tournament            `json:"tournament"`
+	Leagues            []League              `json:"leagues"`
+	Stages             []Stage               `json:"stages"`
+	Fields             []Field               `json:"fields"`
+	Slots              []Slot                `json:"slots"`
+	Teams              []Team                `json:"teams"`
+	Referees           []Referee             `json:"referees"`
+	Matches            []Match               `json:"matches"`
+	Standings          []Standing            `json:"standings"`
 }
 
 func Models() []any {
-	return []any{&Tournament{}, &League{}, &Stage{}, &Field{}, &Slot{}, &Team{}, &Referee{}, &Match{}}
+	return []any{&Tournament{}, &League{}, &Stage{}, &Field{}, &Slot{}, &Team{}, &Referee{}, &Match{}, &StandingPublication{}}
 }

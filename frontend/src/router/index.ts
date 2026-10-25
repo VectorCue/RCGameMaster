@@ -16,9 +16,19 @@ const router = createRouter({
       component: () => import('@/views/SetupView.vue'),
     },
     {
+      path: '/tournaments/:id/games',
+      name: 'stage-games',
+      component: () => import('@/views/StageGamesView.vue'),
+    },
+    {
       path: '/tournaments/:id/schedule',
       name: 'schedule',
       component: () => import('@/views/ScheduleView.vue'),
+    },
+    {
+      path: '/tournaments/:id/standings',
+      name: 'standings',
+      component: () => import('@/views/StandingsView.vue'),
     },
     {
       path: '/tournaments/:id/review',
@@ -36,6 +46,12 @@ const router = createRouter({
     {
       path: '/display/:abbrev',
       name: 'display',
+      component: () => import('@/views/DisplayView.vue'),
+      meta: { public: true },
+    },
+    {
+      path: '/display/:abbrev/fields/:fieldId',
+      name: 'field-display',
       component: () => import('@/views/DisplayView.vue'),
       meta: { public: true },
     },

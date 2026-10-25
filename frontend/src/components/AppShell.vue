@@ -55,9 +55,21 @@ async function signOut() {
         <RouterLink to="/" class="nav-link"><span>◫</span> Overview</RouterLink>
         <RouterLink
           v-if="activeTournament"
+          :to="`/tournaments/${activeTournament.id}/games`"
+          class="nav-link"
+          ><span>✣</span> Stage games</RouterLink
+        >
+        <RouterLink
+          v-if="activeTournament"
           :to="`/tournaments/${activeTournament.id}/schedule`"
           class="nav-link"
           ><span>▦</span> Match schedule</RouterLink
+        >
+        <RouterLink
+          v-if="activeTournament"
+          :to="`/tournaments/${activeTournament.id}/standings`"
+          class="nav-link"
+          ><span>≡</span> Standings</RouterLink
         >
         <RouterLink
           v-if="activeTournament && canAdmin"

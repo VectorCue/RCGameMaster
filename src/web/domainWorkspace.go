@@ -2,6 +2,7 @@ package web
 
 import (
 	"RCJVGameMaster/src/domain"
+	"database/sql"
 	"encoding/json"
 	"errors"
 	"time"
@@ -16,7 +17,7 @@ func protectDelete(tx *gorm.DB, name string, id uint) error {
 		where string
 	}{
 		"leagues": {{&domain.League{}, "parent_id = ?"}, {&domain.Team{}, "league_id = ?"}, {&domain.Stage{}, "league_id = ?"}, {&domain.Field{}, "league_id = ?"}},
-		"stages":  {{&domain.Match{}, "stage_id = ?"}, {&domain.Stage{}, "source_stage_id = ?"}},
+		"stages":  {{&domain.Match{}, "stage_id = ? AND is_placeholder = false"}, {&domain.Stage{}, "source_stage_id = ?"}},
 		"fields":  {{&domain.Match{}, "field_id = ?"}, {&domain.Slot{}, "field_id = ?"}},
 		"slots":   {{&domain.Match{}, "slot_id = ?"}},
 		"teams":   {{&domain.Match{}, "team1_id = ? OR team2_id = ?"}},
@@ -34,10 +35,24 @@ func protectDelete(tx *gorm.DB, name string, id uint) error {
 			return errors.New("record is in use; remove its dependent records first")
 		}
 	}
+	if name == "stages" {
+		var rows []domain.Match
+		if err := tx.Where("stage_id = ?", id).Find(&rows).Error; err != nil {
+			return err
+		}
+		for _, m := range rows {
+			if reservedMatch(m) {
+				return errors.New("unassign reserved empty matches before deleting the stage")
+			}
+		}
+	}
 	if name == "matches" {
 		var m domain.Match
 		if e := tx.First(&m, id).Error; e != nil {
 			return e
+		}
+		if m.IsPlaceholder {
+			return errors.New("empty matches are controlled by the stage team count; unassign reservations and adjust the stage expected team count instead")
 		}
 		if m.IsBye {
 			if e := protectResultChange(tx, m); e != nil {
@@ -95,9 +110,38 @@ func protectUpdate(tx *gorm.DB, name string, id uint, row, old any) error {
 		}
 	case "stages":
 		r, o := row.(*domain.Stage), old.(*domain.Stage)
-		if r.LeagueID != o.LeagueID || r.Type != o.Type || !equalID(r.SourceStageID, o.SourceStageID) {
-			if e := protectDelete(tx, name, id); e != nil {
-				return e
+		resizing := r.ExpectedTeams != o.ExpectedTeams || r.TeamLimit != o.TeamLimit || r.Type != o.Type || r.LeagueID != o.LeagueID || !equalID(r.SourceStageID, o.SourceStageID)
+		if resizing {
+			var n int64
+			if err := tx.Model(&domain.Match{}).Where("stage_id = ? AND is_placeholder = ?", id, false).Count(&n).Error; err != nil {
+				return err
+			}
+			if n > 0 {
+				return errors.New("clear assigned teams before changing this populated stage's participant count or pairing settings")
+			}
+			if err := protectSeededStageDependents(tx, *o); err != nil {
+				return err
+			}
+		}
+		if r.LeagueID != o.LeagueID {
+			var dependent int64
+			if err := tx.Model(&domain.Stage{}).Where("source_stage_id = ?", id).Count(&dependent).Error; err != nil {
+				return err
+			}
+			if dependent > 0 {
+				return errors.New("change dependent stage source settings before moving its source to another league")
+			}
+			var rows []domain.Match
+			if err := tx.Where("stage_id = ?", id).Find(&rows).Error; err != nil {
+				return err
+			}
+			for _, m := range rows {
+				if reservedMatch(m) {
+					return errors.New("unassign reserved empty matches before moving the stage to another league")
+				}
+			}
+			if err := tx.Where("stage_id = ?", id).Delete(&domain.Match{}).Error; err != nil {
+				return err
 			}
 		}
 	case "teams":
@@ -144,6 +188,14 @@ func equalID(a, b *uint) bool {
 	return *a == *b
 }
 func loadWorkspace(db *gorm.DB, id uint, public bool) (domain.Workspace, error) {
+	var workspace domain.Workspace
+	err := db.Transaction(func(tx *gorm.DB) error { var err error; workspace, err = readWorkspace(tx, id, public); return err }, &sql.TxOptions{Isolation: sql.LevelRepeatableRead, ReadOnly: true})
+	return workspace, err
+}
+
+// One consistent read prevents an auto->manual toggle from mixing old settings
+// with newer results while a public response is assembled.
+func readWorkspace(db *gorm.DB, id uint, public bool) (domain.Workspace, error) {
 	w := domain.Workspace{Leagues: []domain.League{}, Stages: []domain.Stage{}, Fields: []domain.Field{}, Slots: []domain.Slot{}, Teams: []domain.Team{}, Referees: []domain.Referee{}, Matches: []domain.Match{}, Standings: []domain.Standing{}}
 	if e := db.First(&w.Tournament, id).Error; e != nil {
 		return w, e
@@ -166,7 +218,18 @@ func loadWorkspace(db *gorm.DB, id uint, public bool) (domain.Workspace, error) 
 	for _, s := range w.Stages {
 		w.Standings = append(w.Standings, domain.Standings(w.Teams, w.Matches, s.LeagueID, s.ID)...)
 	}
+	publications, err := effectiveStandingPublications(db, w)
+	if err != nil {
+		return w, err
+	}
+	w.StandingHistory = publications
+	w.PublishedStandings = publications
 	if public {
+		w.PublishedStandings = latestStandingPublications(w.Stages, publications)
+		w.Standings = []domain.Standing{}
+		for _, publication := range w.PublishedStandings {
+			w.Standings = append(w.Standings, publication.Rows...)
+		}
 		w.Slots = []domain.Slot{}
 		for i := range w.Referees {
 			w.Referees[i].UserID = ""
@@ -177,24 +240,39 @@ func loadWorkspace(db *gorm.DB, id uint, public bool) (domain.Workspace, error) 
 			m := &w.Matches[i]
 			m.Notes = ""
 			var state struct {
-				Phase            string     `json:"phase"`
-				RemainingSeconds int        `json:"remaining_seconds"`
-				Running          bool       `json:"running"`
-				StartedAt        *time.Time `json:"started_at"`
-				BlueTeamID       *uint      `json:"blue_team_id"`
-				KickoffTeamID    *uint      `json:"kickoff_team_id"`
+				Phase            string              `json:"phase"`
+				RemainingSeconds int                 `json:"remaining_seconds"`
+				Running          bool                `json:"running"`
+				StartedAt        *time.Time          `json:"started_at"`
+				BlueTeamID       *uint               `json:"blue_team_id"`
+				KickoffTeamID    *uint               `json:"kickoff_team_id"`
+				Events           []domain.MatchEvent `json:"events"`
+				EndedEarly       bool                `json:"ended_early"`
 			}
-			if json.Unmarshal(m.LiveState, &state) == nil {
-				m.LiveState, _ = json.Marshal(state)
-			} else {
-				m.LiveState = []byte("{}")
+			validState := json.Unmarshal(m.LiveState, &state) == nil
+			if !validState {
 				state.Phase = ""
 			}
 			activePhase := state.Phase == "first_half" || state.Phase == "halftime" || state.Phase == "second_half"
-			if m.Status != "approved" && (m.Status != "in_progress" || !activePhase) {
+			hideScore := m.Status != "approved" && (m.Status != "in_progress" || !activePhase)
+			if hideScore {
 				m.Goals1 = 0
 				m.Goals2 = 0
 			}
+			if validState {
+				publicEvents := make([]domain.MatchEvent, 0, len(state.Events))
+				for _, event := range state.Events {
+					if hideScore && (event.Type == "goal" || event.Type == "goal_removed") {
+						continue
+					}
+					publicEvents = append(publicEvents, event)
+				}
+				state.Events = publicEvents
+				m.LiveState, _ = json.Marshal(state)
+			} else {
+				m.LiveState = []byte("{}")
+			}
+
 		}
 	}
 	return w, nil

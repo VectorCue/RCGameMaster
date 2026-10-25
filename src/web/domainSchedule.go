@@ -14,7 +14,23 @@ func intervalsOverlap(a, b time.Time, minutesA, minutesB int) bool {
 	return a.Before(b.Add(time.Duration(minutesB)*time.Minute)) && b.Before(a.Add(time.Duration(minutesA)*time.Minute))
 }
 func sharesTeam(a, b domain.Match) bool {
-	return a.Team1ID == b.Team1ID || (a.Team2ID != nil && *a.Team2ID == b.Team1ID) || (b.Team2ID != nil && a.Team1ID == *b.Team2ID) || (a.Team2ID != nil && b.Team2ID != nil && *a.Team2ID == *b.Team2ID)
+	if a.IsPlaceholder || b.IsPlaceholder {
+		return false
+	}
+	for _, x := range []uint{a.Team1ID, teamOrZero(a.Team2ID)} {
+		for _, y := range []uint{b.Team1ID, teamOrZero(b.Team2ID)} {
+			if x != 0 && x == y {
+				return true
+			}
+		}
+	}
+	return false
+}
+func teamOrZero(id *uint) uint {
+	if id == nil {
+		return 0
+	}
+	return *id
 }
 func fieldAllowsLeague(field domain.Field, league domain.League) bool {
 	return field.LeagueID == league.ID || (league.ParentID != nil && field.LeagueID == *league.ParentID)
@@ -61,9 +77,19 @@ func validateSchedule(tx *gorm.DB, m *domain.Match, slotID *uint, refereeIDs []u
 	if end.After(slot.EndsAt) {
 		return errors.New("match duration exceeds slot availability")
 	}
-	if m.Team2ID == nil && league.Mode != "scheduling" {
+	if m.IsBye {
 		return errors.New("a bye does not need a playing slot")
 	}
+	if !m.IsPlaceholder && m.Team2ID == nil && league.Mode != "scheduling" {
+		var stage domain.Stage
+		if err := tx.First(&stage, m.StageID).Error; err != nil {
+			return err
+		}
+		if stage.Type != "individual" {
+			return errors.New("a bye does not need a playing slot")
+		}
+	}
+
 	for _, r := range referees {
 		if (r.AvailableFrom != nil && slot.StartsAt.Before(*r.AvailableFrom)) || (r.AvailableUntil != nil && end.After(*r.AvailableUntil)) {
 			return errors.New("referee " + r.Name + " is unavailable during this match")
@@ -157,11 +183,20 @@ func (a *API) review(c fiber.Ctx) error {
 		if e := tx.First(&m, id).Error; e != nil {
 			return e
 		}
+		wasPublishedResult := m.Status == "approved" && m.Published
+		if m.IsPlaceholder || m.Team1ID == 0 {
+			return errors.New("assign teams before reviewing this empty match")
+		}
 		l, e := leagueIn(tx, m.LeagueID, m.TournamentID)
 		if e != nil {
 			return e
 		}
-		if m.Status != "submitted" && m.Status != "approved" && !(!l.RefereeMode && (m.Status == "scheduled" || m.Status == "draft")) {
+		var stage domain.Stage
+		if err := tx.First(&stage, m.StageID).Error; err != nil {
+			return err
+		}
+		individual := stage.Type == "individual"
+		if m.Status != "submitted" && m.Status != "approved" && !((!l.RefereeMode || individual) && (m.Status == "scheduled" || m.Status == "draft")) {
 			return errors.New("result must be submitted before review")
 		}
 		proposed1, proposed2 := m.Goals1, m.Goals2
@@ -194,7 +229,7 @@ func (a *API) review(c fiber.Ctx) error {
 		} else {
 			m.Status = "in_progress"
 			m.Published = false
-			if !l.RefereeMode {
+			if !l.RefereeMode || individual {
 				m.Status = "draft"
 				if m.SlotID != nil {
 					m.Status = "scheduled"
@@ -212,7 +247,13 @@ func (a *API) review(c fiber.Ctx) error {
 		if body.Notes != nil {
 			m.Notes = *body.Notes
 		}
-		return tx.Save(&m).Error
+		if err := tx.Save(&m).Error; err != nil {
+			return err
+		}
+		if wasPublishedResult && (m.Status != "approved" || !m.Published) {
+			return invalidateStandingPublicationForMatch(tx, m)
+		}
+		return nil
 	})
 	if e != nil {
 		return apiError(c, 409, domainError(e))
@@ -244,8 +285,15 @@ func (a *API) publish(c fiber.Ctx) error {
 		if body.Published && m.ScheduledAt == nil && m.Status != "approved" {
 			return errors.New("schedule the match before publishing")
 		}
+		wasPublishedResult := m.Status == "approved" && m.Published
 		m.Published = body.Published
-		return tx.Save(&m).Error
+		if err := tx.Save(&m).Error; err != nil {
+			return err
+		}
+		if wasPublishedResult && !m.Published {
+			return invalidateStandingPublicationForMatch(tx, m)
+		}
+		return nil
 	})
 	if e != nil {
 		return apiError(c, 409, domainError(e))
@@ -287,8 +335,40 @@ func (a *API) updateMatch(c fiber.Ctx) error {
 		if m.Status != "draft" && m.Status != "scheduled" {
 			return errors.New("match metadata can only change before play begins")
 		}
+		previousStageID := m.StageID
+		if body.StageID != m.StageID {
+			var source, target domain.Stage
+			if err := tx.First(&source, m.StageID).Error; err != nil {
+				return err
+			}
+			if err := tx.First(&target, body.StageID).Error; err != nil {
+				return err
+			}
+			if source.PreparedTeams > 0 && source.Type != "manual" || target.PreparedTeams > 0 && target.Type != "manual" {
+				return errors.New("prepared automatic matches must stay in their stage; use Stage games to populate or clear assignments")
+			}
+		}
 		candidate := domain.Match{ID: m.ID, TournamentID: m.TournamentID, LeagueID: body.LeagueID, StageID: body.StageID, Team1ID: body.Team1ID, Team2ID: body.Team2ID, DurationMinutes: body.DurationMinutes, Round: body.Round}
-		if e := validateMatch(tx, &candidate); e != nil {
+		if m.IsPlaceholder && candidate.Team1ID == 0 && candidate.Team2ID == nil {
+			if candidate.StageID != m.StageID || candidate.LeagueID != m.LeagueID || candidate.Round != m.Round {
+				return errors.New("empty match reservations must remain in their prepared stage and round")
+			}
+			league, err := leagueIn(tx, m.LeagueID, m.TournamentID)
+			if err != nil {
+				return err
+			}
+			var stage domain.Stage
+			if err := tx.First(&stage, m.StageID).Error; err != nil {
+				return err
+			}
+			if candidate.DurationMinutes == 0 {
+				candidate.DurationMinutes = defaultMatchDuration(league)
+			}
+			if candidate.DurationMinutes < 1 || candidate.DurationMinutes > 1440 || league.RefereeMode && stage.Type != "individual" && candidate.DurationMinutes < defaultMatchDuration(league) {
+				return errors.New("invalid reserved match duration")
+			}
+			candidate.IsPlaceholder = true
+		} else if e := validateMatch(tx, &candidate); e != nil {
 			return e
 		}
 		m.LeagueID = candidate.LeagueID
@@ -300,11 +380,20 @@ func (a *API) updateMatch(c fiber.Ctx) error {
 		m.Notes = body.Notes
 		m.LiveState = []byte("{}")
 		m.IsBye = false
+		m.IsPlaceholder = candidate.IsPlaceholder
 		refs := append([]uint{}, m.RefereeIDs...)
 		if e := validateSchedule(tx, &m, m.SlotID, refs); e != nil {
 			return e
 		}
-		return tx.Save(&m).Error
+		if err := tx.Save(&m).Error; err != nil {
+			return err
+		}
+		if previousStageID != m.StageID {
+			if err := updatePopulatedRound(tx, previousStageID); err != nil {
+				return err
+			}
+		}
+		return updatePopulatedRound(tx, m.StageID)
 	})
 	if e != nil {
 		return apiError(c, 409, domainError(e))
@@ -321,30 +410,12 @@ func protectResultChange(tx *gorm.DB, m domain.Match) error {
 	}
 	if stage.Type == "swiss" || stage.Type == "knockout" {
 		var n int64
-		if e := tx.Model(&domain.Match{}).Where("stage_id = ? AND round > ?", stage.ID, m.Round).Count(&n).Error; e != nil {
+		if e := tx.Model(&domain.Match{}).Where("stage_id = ? AND round > ? AND is_placeholder = ?", stage.ID, m.Round, false).Count(&n).Error; e != nil {
 			return e
 		}
 		if n > 0 {
 			return errors.New("remove later generated rounds before changing this approved result")
 		}
 	}
-	var stages []domain.Stage
-	if e := tx.Where("league_id = ? AND id <> ?", m.LeagueID, stage.ID).Find(&stages).Error; e != nil {
-		return e
-	}
-	for _, next := range stages {
-		explicit := next.SourceStageID != nil && *next.SourceStageID == stage.ID
-		inferred := next.SourceStageID == nil && (next.Type == "swiss" || next.Type == "knockout") && (next.SortOrder > stage.SortOrder || next.SortOrder == stage.SortOrder && next.ID > stage.ID)
-		if !explicit && !inferred {
-			continue
-		}
-		var n int64
-		if e := tx.Model(&domain.Match{}).Where("stage_id = ?", next.ID).Count(&n).Error; e != nil {
-			return e
-		}
-		if n > 0 {
-			return errors.New("remove dependent generated stages before changing this approved result")
-		}
-	}
-	return nil
+	return protectSeededStageDependents(tx, stage)
 }

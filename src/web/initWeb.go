@@ -64,6 +64,7 @@ func newApp(cfg *config.Config, db *gorm.DB) (*fiber.App, error) {
 }
 
 func InitWeb(cfg *config.Config, db *gorm.DB) {
+	backfillAutomaticStages(db)
 	app, err := newApp(cfg, db)
 	if err != nil {
 		log.Fatalf("Invalid application configuration: %v", err)

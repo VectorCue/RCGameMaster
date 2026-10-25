@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { computed, ref, watch } from 'vue'
+import { computed, nextTick, ref, watch } from 'vue'
 import { useRouter } from 'vue-router'
 import { useWorkspace } from '@/composables/workspace'
 import { api, canAdmin, formatDate, loadTournaments, errorMessage } from '@/lib/api'
@@ -181,9 +181,22 @@ const stage = ref({
   type: 'round_robin',
   sort_order: 0,
   team_limit: 0,
+  expected_teams: 0,
   source_stage_id: null as number | null,
   round: 1,
 })
+const stageTypeChosen = ref(false)
+function defaultStageType(leagueId: number) {
+  return w.value?.leagues.find((league) => league.id === leagueId)?.mode === 'scheduling'
+    ? 'individual'
+    : 'round_robin'
+}
+watch(
+  () => stage.value.league_id,
+  (leagueId) => {
+    if (!stage.value.id && !stageTypeChosen.value) stage.value.type = defaultStageType(leagueId)
+  },
+)
 const team = ref({
   id: 0,
   league_id: 0,
@@ -197,6 +210,25 @@ const referee = ref({ id: 0, name: '', user_id: '', available_from: '', availabl
 const slot = ref({ field_id: 0, starts_at: '', ends_at: '', interval: 30 })
 const copy = ref({ source_field_id: 0, target_field_id: 0 })
 const event = ref<Partial<Tournament>>({})
+const copiedDisplayLink = ref('')
+function fieldDisplayPath(fieldId: number) {
+  return `/display/${encodeURIComponent(w.value?.tournament.abbrev ?? '')}/fields/${fieldId}`
+}
+async function copyFieldDisplayLink(fieldId: number) {
+  const url = new URL(window.location.href)
+  url.hash = fieldDisplayPath(fieldId)
+  copiedDisplayLink.value = url.toString()
+  try {
+    await navigator.clipboard.writeText(copiedDisplayLink.value)
+    notice.value = 'Field display link copied.'
+  } catch {
+    notice.value = 'Select and copy the field display URL below.'
+    await nextTick()
+    const input = document.getElementById('field-display-url') as HTMLInputElement | null
+    input?.focus()
+    input?.select()
+  }
+}
 const teamFilter = ref(0)
 const filteredTeams = computed(
   () => w.value?.teams.filter((t) => !teamFilter.value || t.league_id === teamFilter.value) ?? [],
@@ -218,6 +250,7 @@ function leagueChoices(legacyId?: number) {
   return legacy ? [...subLeagues.value, legacy] : subLeagues.value
 }
 function resetStage() {
+  stageTypeChosen.value = false
   const leagueId = subLeagues.value.some((item) => item.id === stage.value.league_id)
     ? stage.value.league_id
     : (subLeagues.value[0]?.id ?? 0)
@@ -225,9 +258,10 @@ function resetStage() {
     id: 0,
     league_id: leagueId,
     name: '',
-    type: 'round_robin',
+    type: defaultStageType(leagueId),
     sort_order: w.value?.stages.length ?? 0,
     team_limit: 0,
+    expected_teams: 0,
     source_stage_id: null,
     round: 1,
   }
@@ -245,12 +279,70 @@ function resetTeam() {
     external_key: '',
   }
 }
-async function saveStage() {
+function automaticStage(item: { type: string }) {
+  return item.type !== 'manual'
+}
+function stageSlots(id: number) {
+  return w.value?.matches.filter((match) => match.stage_id === id && !match.is_bye) ?? []
+}
+const plannedTeamCount = computed(() => {
+  const count =
+    stage.value.expected_teams ||
+    w.value?.teams.filter((team) => team.league_id === stage.value.league_id).length ||
+    0
+  return stage.value.team_limit > 0 ? Math.min(count, stage.value.team_limit) : count
+})
+async function saveStage(event?: SubmitEvent) {
   if (!stage.value.id && !subLeagues.value.some((item) => item.id === stage.value.league_id)) {
     error.value = 'Add a sub-league before creating stages.'
     return
   }
-  await save('stages', stage.value, resetStage)
+  const populate =
+    event?.submitter instanceof HTMLButtonElement && event.submitter.value === 'populate'
+  const data = { ...stage.value }
+  if (
+    !automaticStage(data) &&
+    (!Number.isSafeInteger(data.expected_teams) ||
+      data.expected_teams < 0 ||
+      data.expected_teams > 256 ||
+      data.expected_teams === 1)
+  ) {
+    const previousCount = w.value?.stages.find((item) => item.id === data.id)?.expected_teams ?? 0
+    data.expected_teams = previousCount === 1 ? 0 : previousCount
+  }
+  if (
+    data.type !== 'individual' &&
+    ((automaticStage(data) && data.expected_teams === 1) || data.team_limit === 1)
+  ) {
+    error.value =
+      'Paired stages need at least two expected or qualifying teams. Use 0 for the full roster, or choose Individual runs for one team.'
+    return
+  }
+  let saved: Stage | undefined
+  if (
+    !(await perform(async () => {
+      saved = (
+        data.id
+          ? await api.put<Stage>(`/stages/${data.id}`, data)
+          : await api.post<Stage>(`/tournaments/${tournamentId.value}/stages`, data)
+      ).data
+    })) ||
+    !saved
+  )
+    return
+  if (populate) {
+    await router.push({
+      name: 'stage-games',
+      params: { id: tournamentId.value },
+      query: { stage: saved.id },
+    })
+    return
+  }
+  const count = stageSlots(saved.id).length
+  notice.value = automaticStage(saved)
+    ? `Stage saved. ${count} game slots are ready for scheduling. Populate teams when the roster or source results are ready.`
+    : 'Stage saved.'
+  resetStage()
 }
 async function saveTeam() {
   if (!team.value.id && !subLeagues.value.some((item) => item.id === team.value.league_id)) {
@@ -300,7 +392,8 @@ async function remove(collection: string, id: number, name: string) {
   await perform(() => api.delete(`/${collection}/${id}`))
 }
 function editStage(item: Stage) {
-  stage.value = { ...item }
+  stageTypeChosen.value = true
+  stage.value = { ...item, expected_teams: item.expected_teams ?? 0 }
   tab.value = 'stages'
 }
 function editTeam(item: Team) {
@@ -738,9 +831,22 @@ async function createSlots() {
               ><small
                 >{{ leagueName(item.league_id) }} · {{ item.type.replace('_', ' ') }} · Order
                 {{ item.sort_order }}</small
+              ><small v-if="automaticStage(item)"
+                >{{ stageSlots(item.id).length }} game slots ·
+                {{ stageSlots(item.id).filter((match) => match.is_placeholder).length }} awaiting
+                teams</small
               >
             </div>
             <div class="button-group flex flex-wrap items-center gap-[9px]">
+              <RouterLink
+                :to="{
+                  name: 'stage-games',
+                  params: { id: tournamentId },
+                  query: { stage: item.id },
+                }"
+                class="text-button"
+                >{{ automaticStage(item) ? 'Populate teams →' : 'Stage games →' }}</RouterLink
+              >
               <button class="text-button" @click="editStage(item)">Edit</button
               ><button
                 class="text-button danger-text"
@@ -772,10 +878,11 @@ async function createSlots() {
             </select></label
           ><label>Name<input v-model="stage.name" required placeholder="Round robin 1" /></label
           ><label
-            >Pairing system<select v-model="stage.type">
+            >Pairing system<select v-model="stage.type" @change="stageTypeChosen = true">
               <option value="round_robin">Round robin</option>
               <option value="swiss">Swiss system</option>
               <option value="knockout">Knockout</option>
+              <option value="individual">Individual runs</option>
               <option value="manual">Manual games</option>
             </select></label
           ><label
@@ -790,7 +897,28 @@ async function createSlots() {
               type="number"
               min="0"
               required
-            /><small>0 = all teams; set 4 for semifinals or 2 for a final.</small></label
+            /><small>{{
+              stage.type === 'individual'
+                ? '0 = all teams; 1 is allowed for a single-team run.'
+                : '0 = all teams; otherwise at least 2. Set 4 for semifinals or 2 for a final.'
+            }}</small></label
+          ><label v-if="automaticStage(stage)"
+            >Expected teams<input
+              v-model.number="stage.expected_teams"
+              type="number"
+              min="0"
+              max="256"
+              step="1"
+              required
+            /><small
+              >0 = use the registered roster.
+              {{
+                stage.type === 'individual'
+                  ? 'Set 1 or more to reserve one run per expected team.'
+                  : 'Set 2 or more to reserve paired games before teams are added.'
+              }}
+              The qualifying-team limit still applies.</small
+            ></label
           ><label class="full-width"
             >Seed from stage<select v-model="stage.source_stage_id">
               <option :value="null">Current league standings / registration order</option>
@@ -805,6 +933,41 @@ async function createSlots() {
               </option>
             </select></label
           >
+          <div v-if="automaticStage(stage)" class="full-width rounded-[8px] bg-[#f5f8ee] p-[16px]">
+            <h3>Automatic game slots</h3>
+            <p class="hint">
+              {{
+                plannedTeamCount
+                  ? `Plan for ${plannedTeamCount} ${plannedTeamCount === 1 ? 'team' : 'teams'}.`
+                  : 'Set the expected team count to reserve games before registration.'
+              }}
+              {{
+                stage.type === 'individual'
+                  ? 'One individual run is reserved for each team.'
+                  : stage.type === 'round_robin'
+                    ? 'All round-robin fixtures are reserved.'
+                    : 'This stage contains one round. Create a separate stage seeded from this one for the next round.'
+              }}
+              Saving prepares empty games that can already receive fields, times and referees.
+            </p>
+            <template v-if="stage.id"
+              ><p class="hint mt-[12px]">
+                {{ stageSlots(stage.id).length }} saved game slots ·
+                {{ stageSlots(stage.id).filter((match) => match.is_placeholder).length }} awaiting
+                teams. Populate teams after the roster or source-stage results are ready;
+                reservations stay attached.
+              </p>
+              <button
+                type="submit"
+                name="stage-action"
+                value="populate"
+                class="button mt-[14px]"
+                :disabled="busy"
+              >
+                Save & populate teams →
+              </button></template
+            >
+          </div>
           <div class="form-actions col-span-full flex flex-wrap gap-[10px]">
             <button class="button primary" :disabled="busy">Save stage</button
             ><button v-if="stage.id" class="button" type="button" @click="resetStage">
@@ -886,6 +1049,9 @@ async function createSlots() {
       <div v-if="tab === 'fields'" class="setup-columns">
         <section class="panel">
           <h2>Fields</h2>
+          <label v-if="copiedDisplayLink" class="mb-[18px]"
+            >Field display URL<input id="field-display-url" :value="copiedDisplayLink" readonly
+          /></label>
           <div v-if="!w.fields.length" class="empty compact">
             Add a field, then create its available timeslots.
           </div>
@@ -896,6 +1062,17 @@ async function createSlots() {
                 >{{ leagueName(item.league_id) }} ·
                 {{ w.slots.filter((s) => s.field_id === item.id).length }} slots</small
               >
+              <div class="mt-[8px] flex flex-wrap gap-[12px]">
+                <RouterLink
+                  :to="fieldDisplayPath(item.id)"
+                  target="_blank"
+                  rel="noopener"
+                  class="text-button"
+                  >Open field display ↗</RouterLink
+                ><button type="button" class="text-button" @click="copyFieldDisplayLink(item.id)">
+                  Copy display link
+                </button>
+              </div>
             </div>
             <div class="button-group flex flex-wrap items-center gap-[9px]">
               <button class="text-button" @click="editField(item)">Edit</button

@@ -3,6 +3,7 @@ import { computed, onBeforeUnmount, onMounted, ref, watch } from 'vue'
 import { useRoute, useRouter } from 'vue-router'
 import { errorMessage, formatDate, publicApi } from '@/lib/api'
 import type { Match, Tournament, Workspace } from '@/lib/types'
+import PublicLeagueChooser from '@/components/PublicLeagueChooser.vue'
 
 const route = useRoute()
 const router = useRouter()
@@ -10,24 +11,64 @@ const workspace = ref<Workspace | null>(null)
 const tournaments = ref<Tournament[]>([])
 const loading = ref(true)
 const error = ref('')
-const leagueId = ref(Number(route.query.league) || 0)
-const stageId = ref(Number(route.query.stage) || 0)
-const tab = ref('matches')
+function queryId(value: unknown) {
+  if (typeof value !== 'string' || !/^[1-9]\d*$/.test(value)) return 0
+  const id = Number(value)
+  return Number.isSafeInteger(id) ? id : 0
+}
+const leagueId = computed(() => queryId(route.query.league))
+const selectedLeague = computed(() =>
+  workspace.value?.leagues.find((league) => league.id === leagueId.value),
+)
+const scopedLeagueIds = computed(() => {
+  const selected = selectedLeague.value
+  const ids = new Set<number>()
+  if (!selected) return ids
+  ids.add(selected.id)
+  if (!selected.parent_id) {
+    for (const league of workspace.value?.leagues || [])
+      if (league.parent_id === selected.id) ids.add(league.id)
+  }
+  return ids
+})
+const scopedMatches = computed(() =>
+  (workspace.value?.matches || []).filter((match) => scopedLeagueIds.value.has(match.league_id)),
+)
+const scopedFields = computed(() =>
+  (workspace.value?.fields || []).filter(
+    (field) =>
+      scopedLeagueIds.value.has(field.league_id) ||
+      field.league_id === selectedLeague.value?.parent_id,
+  ),
+)
+const selectedContext = computed(() => {
+  const league = selectedLeague.value
+  if (!league) return ''
+  if (league.parent_id) return `${leagueName(league.parent_id)} / ${league.name}`
+  return workspace.value?.leagues.some((child) => child.parent_id === league.id)
+    ? `${league.name} / All sub-leagues`
+    : league.name
+})
+const tab = computed(() =>
+  ['matches', 'standings', 'teams'].includes(String(route.query.tab))
+    ? String(route.query.tab)
+    : 'matches',
+)
 const updated = ref<Date | null>(null)
 let poll: ReturnType<typeof setInterval> | undefined
 let loadSequence = 0
 const stages = computed(() =>
   (workspace.value?.stages ?? [])
-    .filter((s) => !leagueId.value || s.league_id === leagueId.value)
-    .sort((a, b) => a.sort_order - b.sort_order),
+    .filter((s) => scopedLeagueIds.value.has(s.league_id))
+    .sort((a, b) => a.sort_order - b.sort_order || a.id - b.id),
 )
+const stageId = computed(() => {
+  const id = queryId(route.query.stage)
+  return stages.value.some((stage) => stage.id === id) ? id : 0
+})
 const matches = computed(() =>
-  (workspace.value?.matches ?? [])
-    .filter(
-      (m) =>
-        (!leagueId.value || m.league_id === leagueId.value) &&
-        (!stageId.value || m.stage_id === stageId.value),
-    )
+  scopedMatches.value
+    .filter((m) => !stageId.value || m.stage_id === stageId.value)
     .sort(
       (a, b) =>
         (a.scheduled_at || '9999').localeCompare(b.scheduled_at || '9999') || a.number - b.number,
@@ -35,31 +76,73 @@ const matches = computed(() =>
 )
 const teams = computed(() =>
   (workspace.value?.teams ?? [])
-    .filter((t) => !leagueId.value || t.league_id === leagueId.value)
+    .filter((t) => scopedLeagueIds.value.has(t.league_id))
     .sort((a, b) => a.name.localeCompare(b.name)),
 )
 const standingGroups = computed(() =>
-  stages.value
-    .filter((s) => !stageId.value || s.id === stageId.value)
-    .map((stage) => ({
-      stage,
-      rows: (workspace.value?.standings ?? [])
-        .filter((row) => row.stage_id === stage.id)
-        .sort((a, b) => a.rank - b.rank),
-    }))
-    .filter((group) => group.rows.length),
+  (workspace.value?.published_standings || [])
+    .filter((publication) => scopedLeagueIds.value.has(publication.league_id))
+    .flatMap((publication) => {
+      const stage = workspace.value?.stages.find(
+        (stage) => stage.id === publication.stage_id && stage.league_id === publication.league_id,
+      )
+      return stage
+        ? [
+            {
+              stage,
+              published_at: publication.published_at,
+              rows: [...publication.rows].sort((a, b) => a.rank - b.rank),
+            },
+          ]
+        : []
+    }),
 )
 const teamName = (id: number | null) =>
-  workspace.value?.teams.find((t) => t.id === id)?.name || 'Bye'
+  workspace.value?.teams.find((t) => t.id === id)?.name || (id === 0 ? 'Awaiting teams' : 'Bye')
+function opponentName(match: Match) {
+  if (match.is_placeholder) return 'Awaiting teams'
+  return match.team2_id ? teamName(match.team2_id) : match.is_bye ? 'Bye' : 'Individual run'
+}
+function individualRun(match: Match) {
+  return (
+    workspace.value?.stages.find((stage) => stage.id === match.stage_id)?.type === 'individual' ||
+    (!match.is_placeholder && !match.is_bye && !match.team2_id)
+  )
+}
+function firstTeamName(match: Match) {
+  return individualRun(match) && match.is_placeholder ? 'Awaiting team' : teamName(match.team1_id)
+}
 const fieldName = (id: number | null) =>
   workspace.value?.fields.find((f) => f.id === id)?.name || 'To be assigned'
 const leagueName = (id: number) => workspace.value?.leagues.find((l) => l.id === id)?.name || ''
 const stageName = (id: number) => workspace.value?.stages.find((s) => s.id === id)?.name || ''
 const time = (value: string | null) => formatDate(value, workspace.value?.tournament.timezone)
 function matchStatus(match: Match) {
+  if (match.is_placeholder) return 'Awaiting teams'
   if (match.status === 'approved') return 'Final'
   if (match.status === 'submitted' || match.live_state?.phase === 'finished') return 'Under review'
   return match.status === 'in_progress' ? 'Live' : 'Upcoming'
+}
+async function chooseLeague(id: number) {
+  await router.push({
+    name: 'public',
+    params: { abbrev: route.params.abbrev },
+    query: { ...route.query, league: String(id), stage: undefined },
+  })
+}
+async function changeLeague() {
+  await router.push({
+    name: 'public',
+    params: { abbrev: route.params.abbrev },
+    query: { ...route.query, league: undefined, stage: undefined },
+  })
+}
+async function chooseTab(value: string) {
+  await router.replace({ query: { ...route.query, tab: value === 'matches' ? undefined : value } })
+}
+async function chooseStage(event: Event) {
+  const id = (event.target as HTMLSelectElement).value
+  await router.replace({ query: { ...route.query, stage: id === '0' ? undefined : id } })
 }
 async function load() {
   const abbrev = String(route.params.abbrev || '')
@@ -87,14 +170,9 @@ watch(
   async () => {
     workspace.value = null
     loading.value = true
-    leagueId.value = 0
-    stageId.value = 0
     await load()
   },
 )
-watch(leagueId, () => {
-  stageId.value = 0
-})
 onMounted(async () => {
   try {
     tournaments.value = (await publicApi.get<Tournament[]>('/tournaments')).data
@@ -152,186 +230,196 @@ onBeforeUnmount(() => clearInterval(poll))
             </div>
           </div>
         </section>
-        <div class="public-stats">
-          <div>
-            <strong>{{ workspace.teams.length }}</strong
-            ><span>Teams</span>
+        <template v-if="!selectedLeague"
+          ><p v-if="route.query.league !== undefined" class="selection-unavailable" role="status">
+            That league is not available in this tournament. Choose a league below.
+          </p>
+          <PublicLeagueChooser :leagues="workspace.leagues" @select="chooseLeague"
+        /></template>
+        <template v-else>
+          <section class="selected-league-bar">
+            <div>
+              <span>YOUR COMPETITION</span>
+              <h2>{{ selectedContext }}</h2>
+            </div>
+            <button @click="changeLeague">← Change league</button>
+          </section>
+          <div class="public-stats">
+            <div>
+              <strong>{{ teams.length }}</strong
+              ><span>Teams</span>
+            </div>
+            <div>
+              <strong>{{ scopedFields.length }}</strong
+              ><span>Fields</span>
+            </div>
+            <div>
+              <strong>{{ scopedMatches.length }}</strong
+              ><span>Published matches</span>
+            </div>
+            <div>
+              <strong>{{ scopedMatches.filter((m) => m.status === 'approved').length }}</strong
+              ><span>Results confirmed</span>
+            </div>
           </div>
-          <div>
-            <strong>{{
-              workspace.leagues.filter((l) => workspace?.teams.some((t) => t.league_id === l.id))
-                .length
-            }}</strong
-            ><span>Leagues</span>
+          <div class="public-controls">
+            <div class="public-tabs" role="tablist" aria-label="Tournament information">
+              <button
+                v-for="item in ['matches', 'standings', 'teams']"
+                :key="item"
+                :class="{ active: tab === item }"
+                role="tab"
+                :aria-selected="tab === item"
+                @click="chooseTab(item)"
+              >
+                {{ item }}
+              </button>
+            </div>
+            <div v-if="tab === 'matches'" class="public-filters">
+              <label
+                ><span class="sr-only">Stage</span
+                ><select :value="stageId" @change="chooseStage">
+                  <option :value="0">All stages</option>
+                  <option v-for="stage in stages" :key="stage.id" :value="stage.id">
+                    {{ scopedLeagueIds.size > 1 ? `${leagueName(stage.league_id)} · ` : ''
+                    }}{{ stage.name }}
+                  </option>
+                </select></label
+              >
+            </div>
           </div>
-          <div>
-            <strong>{{ workspace.matches.length }}</strong
-            ><span>Published matches</span>
-          </div>
-          <div>
-            <strong>{{ workspace.matches.filter((m) => m.status === 'approved').length }}</strong
-            ><span>Results confirmed</span>
-          </div>
-        </div>
-        <div class="public-controls">
-          <div class="public-tabs" role="tablist" aria-label="Tournament information">
-            <button
-              v-for="item in ['matches', 'standings', 'teams']"
-              :key="item"
-              :class="{ active: tab === item }"
-              role="tab"
-              :aria-selected="tab === item"
-              @click="tab = item"
-            >
-              {{ item }}
-            </button>
-          </div>
-          <div class="public-filters">
-            <label
-              ><span class="sr-only">League</span
-              ><select v-model="leagueId">
-                <option :value="0">All leagues</option>
-                <option v-for="league in workspace.leagues" :key="league.id" :value="league.id">
-                  {{ league.name }}
-                </option>
-              </select></label
-            ><label v-if="tab !== 'teams'"
-              ><span class="sr-only">Stage</span
-              ><select v-model="stageId">
-                <option :value="0">All stages</option>
-                <option v-for="stage in stages" :key="stage.id" :value="stage.id">
-                  {{ stage.name }}
-                </option>
-              </select></label
-            >
-          </div>
-        </div>
-        <section v-if="tab === 'matches'" class="public-panel">
-          <header class="panel-heading">
-            <h2>Match schedule</h2>
-            <span>{{ matches.length }} matches</span>
-          </header>
-          <div v-if="!matches.length" class="public-empty">
-            No published matches for this selection yet.
-          </div>
-          <div v-else class="public-table-wrap">
-            <table class="public-table matches-table">
-              <thead>
-                <tr>
-                  <th>Time / Field</th>
-                  <th>Match</th>
-                  <th class="score-column">Score</th>
-                  <th>Status</th>
-                </tr>
-              </thead>
-              <tbody>
-                <tr v-for="match in matches" :key="match.id">
-                  <td>
-                    <strong>{{ time(match.scheduled_at) }}</strong
-                    ><small>{{ fieldName(match.field_id) }}</small>
-                  </td>
-                  <td>
-                    <small
-                      >{{ leagueName(match.league_id) }} · {{ stageName(match.stage_id) }} · #{{
-                        match.number
-                      }}</small
-                    >
-                    <div class="public-team-pair">
-                      <strong>{{ teamName(match.team1_id) }}</strong
-                      ><span>vs</span
-                      ><strong>{{
-                        match.team2_id
-                          ? teamName(match.team2_id)
-                          : match.is_bye
-                            ? 'Bye'
-                            : 'Solo run'
-                      }}</strong>
-                    </div>
-                  </td>
-                  <td class="score-column">
-                    <strong v-if="match.status === 'approved'" class="result-score"
-                      >{{ match.goals1 }} : {{ match.goals2 }}</strong
-                    ><span v-else class="unplayed">—</span>
-                  </td>
-                  <td>
-                    <span class="public-status" :class="match.status">{{
-                      matchStatus(match)
-                    }}</span>
-                  </td>
-                </tr>
-              </tbody>
-            </table>
-          </div>
-        </section>
-        <section v-else-if="tab === 'standings'" class="standings-panels">
-          <div v-if="!standingGroups.length" class="public-panel public-empty">
-            Standings appear when confirmed results are published.
-          </div>
-          <article v-for="group in standingGroups" :key="group.stage.id" class="public-panel">
+          <section v-if="tab === 'matches'" class="public-panel">
             <header class="panel-heading">
-              <h2>
-                {{ leagueName(group.stage.league_id) }} <span>· {{ group.stage.name }}</span>
-              </h2>
-              <span>Confirmed results</span>
+              <h2>Match schedule</h2>
+              <span>{{ matches.length }} matches</span>
             </header>
-            <div class="public-table-wrap">
-              <table class="public-table standings-table">
+            <div v-if="!matches.length" class="public-empty">
+              No published matches for this selection yet.
+            </div>
+            <div v-else class="public-table-wrap">
+              <table class="public-table matches-table">
                 <thead>
                   <tr>
-                    <th>#</th>
-                    <th>Team</th>
-                    <th title="Played">P</th>
-                    <th title="Wins">W</th>
-                    <th title="Draws">D</th>
-                    <th title="Losses">L</th>
-                    <th title="Goals for and against">GF : GA</th>
-                    <th title="Goal difference">GD</th>
-                    <th>Pts</th>
+                    <th>Time / Field</th>
+                    <th>Match</th>
+                    <th class="score-column">Score</th>
+                    <th>Status</th>
                   </tr>
                 </thead>
                 <tbody>
-                  <tr v-for="row in group.rows" :key="row.team_id">
+                  <tr v-for="match in matches" :key="match.id">
                     <td>
-                      <span class="rank" :class="{ first: row.rank === 1 }">{{ row.rank }}</span>
+                      <strong>{{ time(match.scheduled_at) }}</strong
+                      ><small>{{ fieldName(match.field_id) }}</small>
                     </td>
                     <td>
-                      <strong>{{ teamName(row.team_id) }}</strong>
+                      <small
+                        >{{ leagueName(match.league_id) }} · {{ stageName(match.stage_id) }} · #{{
+                          match.number
+                        }}</small
+                      >
+                      <div class="public-team-pair">
+                        <strong>{{ firstTeamName(match) }}</strong>
+                        <small v-if="individualRun(match)">Individual run</small>
+                        <template v-else
+                          ><span>vs</span><strong>{{ opponentName(match) }}</strong></template
+                        >
+                      </div>
                     </td>
-                    <td>{{ row.played }}</td>
-                    <td>{{ row.wins }}</td>
-                    <td>{{ row.draws }}</td>
-                    <td>{{ row.losses }}</td>
-                    <td>{{ row.scored }} : {{ row.conceded }}</td>
-                    <td>{{ row.difference > 0 ? '+' : '' }}{{ row.difference }}</td>
+                    <td class="score-column">
+                      <span v-if="individualRun(match) && match.status === 'approved'"
+                        >Completed</span
+                      >
+                      <strong v-else-if="match.status === 'approved'" class="result-score"
+                        >{{ match.goals1 }} : {{ match.goals2 }}</strong
+                      ><span v-else class="unplayed">—</span>
+                    </td>
                     <td>
-                      <strong class="standing-points">{{ row.points }}</strong>
+                      <span class="public-status" :class="match.status">{{
+                        matchStatus(match)
+                      }}</span>
                     </td>
                   </tr>
                 </tbody>
               </table>
             </div>
-          </article>
-        </section>
-        <section v-else class="public-panel">
-          <header class="panel-heading">
-            <h2>The teams</h2>
-            <span>{{ teams.length }} teams</span>
-          </header>
-          <div v-if="!teams.length" class="public-empty">No teams in this league yet.</div>
-          <div v-else class="public-team-grid">
-            <article v-for="team in teams" :key="team.id">
-              <span class="team-monogram">{{ team.name.slice(0, 2).toUpperCase() }}</span>
-              <div>
-                <strong>{{ team.name }}</strong
-                ><small>{{ team.affiliation || leagueName(team.league_id) }}</small
-                ><span
-                  >{{ leagueName(team.league_id) }}
-                  <template v-if="team.startnumber">· #{{ team.startnumber }}</template></span
+          </section>
+          <section v-else-if="tab === 'standings'" class="standings-panels">
+            <div v-if="!standingGroups.length" class="public-panel public-empty">
+              No standings published yet.
+            </div>
+            <article v-for="group in standingGroups" :key="group.stage.id" class="public-panel">
+              <header class="panel-heading">
+                <h2>
+                  {{ leagueName(group.stage.league_id) }} <span>· {{ group.stage.name }}</span>
+                </h2>
+                <span class="standings-published"
+                  >Published
+                  <time :datetime="group.published_at">{{ time(group.published_at) }}</time></span
                 >
+              </header>
+              <div v-if="!group.rows.length" class="public-empty">
+                No ranked teams in this published table.
+              </div>
+              <div v-else class="public-table-wrap">
+                <table class="public-table standings-table">
+                  <thead>
+                    <tr>
+                      <th>#</th>
+                      <th>Team</th>
+                      <th title="Played">P</th>
+                      <th title="Wins">W</th>
+                      <th title="Draws">D</th>
+                      <th title="Losses">L</th>
+                      <th title="Goals for and against">GF : GA</th>
+                      <th title="Goal difference">GD</th>
+                      <th>Pts</th>
+                    </tr>
+                  </thead>
+                  <tbody>
+                    <tr v-for="row in group.rows" :key="row.team_id">
+                      <td>
+                        <span class="rank" :class="{ first: row.rank === 1 }">{{ row.rank }}</span>
+                      </td>
+                      <td>
+                        <strong>{{ teamName(row.team_id) }}</strong>
+                      </td>
+                      <td>{{ row.played }}</td>
+                      <td>{{ row.wins }}</td>
+                      <td>{{ row.draws }}</td>
+                      <td>{{ row.losses }}</td>
+                      <td>{{ row.scored }} : {{ row.conceded }}</td>
+                      <td>{{ row.difference > 0 ? '+' : '' }}{{ row.difference }}</td>
+                      <td>
+                        <strong class="standing-points">{{ row.points }}</strong>
+                      </td>
+                    </tr>
+                  </tbody>
+                </table>
               </div>
             </article>
-          </div>
-        </section>
+          </section>
+          <section v-else class="public-panel">
+            <header class="panel-heading">
+              <h2>The teams</h2>
+              <span>{{ teams.length }} teams</span>
+            </header>
+            <div v-if="!teams.length" class="public-empty">No teams in this league yet.</div>
+            <div v-else class="public-team-grid">
+              <article v-for="team in teams" :key="team.id">
+                <span class="team-monogram">{{ team.name.slice(0, 2).toUpperCase() }}</span>
+                <div>
+                  <strong>{{ team.name }}</strong
+                  ><small>{{ team.affiliation || leagueName(team.league_id) }}</small
+                  ><span
+                    >{{ leagueName(team.league_id) }}
+                    <template v-if="team.startnumber">· #{{ team.startnumber }}</template></span
+                  >
+                </div>
+              </article>
+            </div>
+          </section>
+        </template>
       </template>
       <section v-else-if="!error" class="public-panel tournament-directory">
         <h1>Explore tournaments</h1>
@@ -343,15 +431,83 @@ onBeforeUnmount(() => clearInterval(poll))
       </section>
       <footer class="public-footer">
         <span>RCJV GameMaster</span
-        ><span
-          >Schedules update automatically · Results appear after referee and editor approval</span
-        >
+        ><span>Schedules update automatically · Standings appear when published</span>
       </footer>
     </main>
   </div>
 </template>
 
 <style scoped>
+.selected-league-bar {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 20px;
+  margin: 3px 0 20px;
+}
+.selected-league-bar > div > span {
+  color: #0a947e;
+  font-size: 9px;
+  font-weight: 800;
+  letter-spacing: 0.15em;
+}
+.selected-league-bar h2 {
+  margin: 7px 0 0;
+  color: #284f65;
+  font-size: 21px;
+  letter-spacing: -0.35px;
+}
+.selected-league-bar button {
+  border: 1px solid #cbdde5;
+  background: white;
+  border-radius: 7px;
+  color: #52758a;
+  font-size: 11px;
+  font-weight: 650;
+  padding: 11px 15px;
+  cursor: pointer;
+  white-space: nowrap;
+}
+.selected-league-bar button:hover {
+  border-color: #159c84;
+  color: #06816c;
+}
+.selection-unavailable {
+  color: #94743a;
+  font-size: 12px;
+  background: #fff6e7;
+  border: 1px solid #eeddbb;
+  border-radius: 9px;
+  padding: 13px 17px;
+  margin: 0 0 20px;
+}
+.standings-published {
+  white-space: normal !important;
+  text-align: right;
+  line-height: 1.7;
+}
+.standings-published time {
+  color: #6c9b8c;
+  margin-left: 3px;
+}
+@media (max-width: 600px) {
+  .selected-league-bar {
+    align-items: flex-start;
+    gap: 16px;
+  }
+  .selected-league-bar h2 {
+    font-size: 18px;
+    line-height: 1.4;
+  }
+  .selected-league-bar button {
+    padding: 9px 11px;
+    font-size: 10px;
+  }
+  .standings-published {
+    font-size: 9px !important;
+    max-width: 145px;
+  }
+}
 .public-page {
   min-height: 100vh;
   background: #f3f6f8;

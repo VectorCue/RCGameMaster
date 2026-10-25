@@ -15,6 +15,7 @@ export interface League {
   mode: 'full' | 'scheduling'
   referee_mode: boolean
   inspections_enabled: boolean
+  standings_auto_publish: boolean
   robot_count: number
   max_weight_g: number
   ball_zone_cm: number
@@ -29,9 +30,10 @@ export interface Stage {
   tournament_id: number
   league_id: number
   name: string
-  type: 'round_robin' | 'swiss' | 'knockout' | 'manual'
+  type: 'round_robin' | 'swiss' | 'knockout' | 'individual' | 'manual'
   sort_order: number
   team_limit: number
+  expected_teams: number
   source_stage_id: number | null
   round: number
 }
@@ -85,7 +87,22 @@ export interface RobotTimeout {
   robot: number
   ends_at: string
 }
+export interface MatchEvent {
+  id: number
+  at: string
+  type: string
+  phase: string
+  remaining_seconds: number
+  team_id?: number
+  robot?: number
+  side?: 'blue' | 'yellow'
+  next_phase?: string
+  forced?: boolean
+}
 export interface LiveState {
+  events?: MatchEvent[]
+  ended_early?: boolean
+  end_reason?: string
   checks: RobotCheck[]
   phase: 'pregame' | 'ready' | 'first_half' | 'halftime' | 'second_half' | 'finished'
   remaining_seconds: number
@@ -99,6 +116,7 @@ export interface LiveState {
   signed_goals2?: number
 }
 export interface Match {
+  is_placeholder: boolean
   is_bye: boolean
   id: number
   tournament_id: number
@@ -135,6 +153,12 @@ export interface Standing {
   points: number
   rank: number
 }
+export interface PublishedStandings {
+  league_id: number
+  stage_id: number
+  published_at: string
+  rows: Standing[]
+}
 export interface Workspace {
   tournament: Tournament
   leagues: League[]
@@ -145,4 +169,5 @@ export interface Workspace {
   referees: Referee[]
   matches: Match[]
   standings: Standing[]
+  published_standings: PublishedStandings[]
 }

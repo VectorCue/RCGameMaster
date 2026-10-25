@@ -2,13 +2,32 @@
 import { computed, onBeforeUnmount, onMounted, ref, watch } from 'vue'
 import { useRoute } from 'vue-router'
 import { errorMessage, publicApi } from '@/lib/api'
-import type { Match, Workspace } from '@/lib/types'
+import type { Match, MatchEvent, Workspace } from '@/lib/types'
 
 const route = useRoute()
 const workspace = ref<Workspace | null>(null)
 const loading = ref(true)
 const error = ref('')
-const fieldId = ref(Number(route.query.field) || 0)
+const fieldReference = computed(() =>
+  Object.prototype.hasOwnProperty.call(route.params, 'fieldId')
+    ? route.params.fieldId
+    : Object.prototype.hasOwnProperty.call(route.query, 'field')
+      ? route.query.field
+      : undefined,
+)
+const fieldRequested = computed(() => fieldReference.value !== undefined)
+const fieldId = computed(() => {
+  const value = fieldReference.value
+  if (typeof value !== 'string' || !/^\d+$/.test(value)) return null
+  const id = Number(value)
+  return Number.isSafeInteger(id) && id > 0 ? id : null
+})
+const selectedField = computed(() =>
+  workspace.value?.fields.find((field) => field.id === fieldId.value),
+)
+const fieldUnavailable = computed(
+  () => !!workspace.value && fieldRequested.value && !selectedField.value,
+)
 const now = ref(Date.now())
 const updatedAt = ref(0)
 let tick: ReturnType<typeof setInterval> | undefined
@@ -17,7 +36,34 @@ let serverOffset = 0
 let loadSequence = 0
 const timezone = computed(() => workspace.value?.tournament.timezone || 'UTC')
 const fieldMatches = computed(() =>
-  (workspace.value?.matches ?? []).filter((m) => !fieldId.value || m.field_id === fieldId.value),
+  fieldUnavailable.value
+    ? []
+    : (workspace.value?.matches ?? []).filter(
+        (m) => m.published && (!fieldRequested.value || m.field_id === fieldId.value),
+      ),
+)
+const eventRows = computed(() =>
+  fieldMatches.value
+    .flatMap((match) => {
+      const goalsVisible =
+        match.status === 'approved' ||
+        (match.status === 'in_progress' &&
+          ['first_half', 'halftime', 'second_half'].includes(match.live_state?.phase || ''))
+      return (match.live_state?.events || [])
+        .filter(
+          (event) =>
+            Number.isFinite(Date.parse(event.at)) &&
+            (goalsVisible || !['goal', 'goal_removed'].includes(event.type)),
+        )
+        .map((event) => ({ match, event }))
+    })
+    .sort(
+      (a, b) =>
+        Date.parse(b.event.at) - Date.parse(a.event.at) ||
+        b.event.id - a.event.id ||
+        b.match.id - a.match.id,
+    )
+    .slice(0, 100),
 )
 const upcoming = computed(() =>
   fieldMatches.value
@@ -88,7 +134,20 @@ const phase = computed(() => {
   return `${label}${live?.running || live?.phase === 'finished' ? '' : ' · Paused'}`
 })
 const teamName = (id: number | null | undefined) =>
-  workspace.value?.teams.find((t) => t.id === id)?.name || 'Bye'
+  workspace.value?.teams.find((t) => t.id === id)?.name || (id === 0 ? 'Awaiting teams' : 'Bye')
+function opponentName(match: Match) {
+  if (match.is_placeholder) return 'Awaiting teams'
+  return match.team2_id ? teamName(match.team2_id) : match.is_bye ? 'Bye' : 'Individual run'
+}
+function individualRun(match: Match) {
+  return (
+    workspace.value?.stages.find((stage) => stage.id === match.stage_id)?.type === 'individual' ||
+    (!match.is_placeholder && !match.is_bye && !match.team2_id)
+  )
+}
+function firstTeamName(match: Match) {
+  return individualRun(match) && match.is_placeholder ? 'Awaiting team' : teamName(match.team1_id)
+}
 const fieldName = (id: number | null | undefined) =>
   workspace.value?.fields.find((f) => f.id === id)?.name || 'Field to be assigned'
 const leagueName = (id: number | undefined) =>
@@ -110,6 +169,56 @@ function clock(seconds: number) {
   const sec = seconds % 60
   return `${hours ? `${String(hours).padStart(2, '0')}:` : ''}${String(min).padStart(2, '0')}:${String(sec).padStart(2, '0')}`
 }
+function eventTime(event: MatchEvent) {
+  return new Intl.DateTimeFormat([], {
+    timeZone: timezone.value,
+    hour: '2-digit',
+    minute: '2-digit',
+    second: '2-digit',
+  }).format(new Date(event.at))
+}
+function eventPhase(phase: string) {
+  return (
+    (
+      {
+        pregame: 'Pregame',
+        ready: 'Kickoff',
+        first_half: 'First half',
+        halftime: 'Half-time',
+        second_half: 'Second half',
+        finished: 'Full time',
+      } as Record<string, string>
+    )[phase] || phase
+  )
+}
+function eventLabel(event: MatchEvent) {
+  switch (event.type) {
+    case 'match_started':
+      return 'Match started'
+    case 'clock_started':
+      return 'Clock started'
+    case 'clock_paused':
+      return 'Clock paused'
+    case 'goal':
+      return 'Goal scored'
+    case 'goal_removed':
+      return 'Goal removed'
+    case 'robot_timeout':
+      return `Robot ${event.robot} · timeout started`
+    case 'robot_timeout_reset':
+      return `Robot ${event.robot} · timeout reset to 1:00`
+    case 'robot_returned':
+      return `Robot ${event.robot} · returned to play`
+    case 'period_advanced':
+      return `${event.forced ? 'Skipped' : 'Advanced'} to ${eventPhase(event.next_phase || '')}`
+    case 'match_ended':
+      return event.forced ? 'Match finished · period skipped' : 'Match finished'
+    case 'match_ended_early':
+      return 'Match ended early'
+    default:
+      return event.type.replaceAll('_', ' ')
+  }
+}
 async function load() {
   const abbrev = String(route.params.abbrev)
   const sequence = ++loadSequence
@@ -129,17 +238,11 @@ async function load() {
     if (sequence === loadSequence && abbrev === String(route.params.abbrev)) loading.value = false
   }
 }
-async function fullscreen() {
-  if (!document.fullscreenElement)
-    await document.documentElement.requestFullscreen().catch(() => {})
-  else await document.exitFullscreen().catch(() => {})
-}
 watch(
   () => route.params.abbrev,
   async () => {
     workspace.value = null
     loading.value = true
-    fieldId.value = Number(route.query.field) || 0
     await load()
   },
 )
@@ -166,6 +269,9 @@ onBeforeUnmount(() => {
         <div>
           <small>RCJV GAMEMASTER · TOURNAMENT LIVE</small>
           <h1>{{ workspace?.tournament.name || 'Tournament display' }}</h1>
+          <span class="display-field-title">{{
+            fieldRequested ? selectedField?.name || 'Field unavailable' : 'All fields'
+          }}</span>
         </div>
       </div>
       <div class="wall-clock">
@@ -180,16 +286,7 @@ onBeforeUnmount(() => {
         }}</span
       >
       <div>
-        <label
-          ><span class="sr-only">Field</span
-          ><select v-model="fieldId">
-            <option :value="0">All fields</option>
-            <option v-for="f in workspace?.fields || []" :key="f.id" :value="f.id">
-              {{ f.name }}
-            </option>
-          </select></label
-        ><button @click="fullscreen">⛶ <span>Full screen</span></button
-        ><RouterLink v-if="workspace" :to="`/public/${workspace.tournament.abbrev}`"
+        <RouterLink v-if="workspace" :to="`/public/${workspace.tournament.abbrev}`"
           >Tournament board ↗</RouterLink
         >
       </div>
@@ -199,6 +296,11 @@ onBeforeUnmount(() => {
       <h2>Display unavailable</h2>
       <p>{{ error }}</p>
       <button @click="load">Try again</button>
+    </div>
+    <div v-else-if="fieldUnavailable" class="display-empty" role="status">
+      <h2>Field unavailable</h2>
+      <p>The field in this display URL is invalid or does not belong to this tournament.</p>
+      <p>Open a display link from the tournament’s field settings.</p>
     </div>
     <template v-else-if="workspace">
       <section
@@ -211,7 +313,7 @@ onBeforeUnmount(() => {
             >{{ leagueName(featured.league_id) }} <b>·</b> {{ stageName(featured.stage_id) }}</span
           ><strong>{{ fieldName(featured.field_id) }} <b>·</b> #{{ featured.number }}</strong>
         </header>
-        <div class="featured-teams">
+        <div class="featured-teams" :class="{ 'individual-run': individualRun(featured) }">
           <div
             class="featured-team"
             :class="
@@ -223,28 +325,36 @@ onBeforeUnmount(() => {
             "
           >
             <span>{{
-              featured.live_state?.blue_team_id
-                ? featured.live_state.blue_team_id === featured.team1_id
-                  ? 'BLUE SIDE'
-                  : 'YELLOW SIDE'
-                : 'HOME'
+              individualRun(featured)
+                ? 'TEAM'
+                : featured.live_state?.blue_team_id
+                  ? featured.live_state.blue_team_id === featured.team1_id
+                    ? 'BLUE SIDE'
+                    : 'YELLOW SIDE'
+                  : 'HOME'
             }}</span>
-            <h2>{{ teamName(featured.team1_id) }}</h2>
+            <h2>{{ firstTeamName(featured) }}</h2>
             <small v-if="featured.live_state?.kickoff_team_id === featured.team1_id">KICKOFF</small>
           </div>
           <div class="featured-centre">
-            <span v-if="hasLiveScore" class="live-pill">MATCH LIVE</span
-            ><strong v-if="hasLiveScore" class="live-score"
-              >{{ featured.goals1 }}<span>:</span>{{ featured.goals2 }}</strong
-            ><strong v-else class="versus">{{
-              featured.status === 'in_progress' ? '— : —' : 'VS'
-            }}</strong
-            ><span class="timer-phase">{{ phase }}</span
+            <span v-if="individualRun(featured)" class="timer-phase">INDIVIDUAL RUN</span>
+            <template v-else
+              ><span v-if="hasLiveScore" class="live-pill">MATCH LIVE</span
+              ><strong v-if="hasLiveScore" class="live-score"
+                >{{ featured.goals1 }}<span>:</span>{{ featured.goals2 }}</strong
+              ><strong v-else class="versus">{{
+                featured.status === 'in_progress' ? '— : —' : 'VS'
+              }}</strong></template
+            >
+            <span class="timer-phase">{{
+              individualRun(featured) ? (timer === 0 ? 'Starting soon' : 'Starts in') : phase
+            }}</span
             ><strong class="display-timer" :class="{ expired: timer === 0 && hasLiveScore }">{{
               timer === null ? '— : —' : clock(timer)
             }}</strong>
           </div>
           <div
+            v-if="!individualRun(featured)"
             class="featured-team"
             :class="
               featured.live_state?.blue_team_id === featured.team2_id
@@ -262,13 +372,7 @@ onBeforeUnmount(() => {
                 : 'AWAY'
             }}</span>
             <h2>
-              {{
-                featured.team2_id
-                  ? teamName(featured.team2_id)
-                  : featured.is_bye
-                    ? 'Bye'
-                    : 'Solo run'
-              }}
+              {{ opponentName(featured) }}
             </h2>
             <small v-if="featured.live_state?.kickoff_team_id === featured.team2_id">KICKOFF</small>
           </div>
@@ -300,11 +404,12 @@ onBeforeUnmount(() => {
             <strong class="next-time">{{ scheduledTime(match) }}</strong>
             <div>
               <strong
-                >{{ teamName(match.team1_id) }} <span>vs</span>
-                {{
-                  match.team2_id ? teamName(match.team2_id) : match.is_bye ? 'Bye' : 'Solo run'
-                }}</strong
+                >{{ firstTeamName(match) }}
+                <template v-if="!individualRun(match)"
+                  ><span>vs</span> {{ opponentName(match) }}</template
+                ></strong
               ><small>{{ leagueName(match.league_id) }} · {{ fieldName(match.field_id) }}</small>
+              <small v-if="individualRun(match)">Individual run</small>
             </div>
             <span class="next-number">#{{ match.number }}</span>
           </div>
@@ -317,13 +422,39 @@ onBeforeUnmount(() => {
           <div v-if="!results.length" class="list-empty">Results appear after review.</div>
           <div v-for="match in results" :key="match.id" class="result-row">
             <span>{{ teamName(match.team1_id) }}</span
-            ><strong>{{ match.goals1 }} : {{ match.goals2 }}</strong
-            ><span>{{
-              match.team2_id ? teamName(match.team2_id) : match.is_bye ? 'Bye' : 'Solo run'
-            }}</span>
+            ><strong>{{
+              individualRun(match) ? 'Completed' : `${match.goals1} : ${match.goals2}`
+            }}</strong
+            ><span>{{ opponentName(match) }}</span>
           </div>
         </section>
       </div>
+      <section class="event-log">
+        <header>
+          <h2>Match events</h2>
+          <span>Newest first · {{ fieldRequested ? selectedField?.name : 'All fields' }}</span>
+        </header>
+        <div v-if="!eventRows.length" class="list-empty">No recorded match events yet.</div>
+        <ol v-else class="event-list">
+          <li v-for="row in eventRows" :key="`${row.match.id}-${row.event.id}`" class="event-row">
+            <time :datetime="row.event.at">{{ eventTime(row.event) }}</time>
+            <div class="event-context">
+              <strong>Match #{{ row.match.number }}</strong
+              ><small
+                >{{ fieldName(row.match.field_id) }} · {{ eventPhase(row.event.phase) }} ·
+                {{ clock(row.event.remaining_seconds) }}</small
+              >
+            </div>
+            <div class="event-action">
+              <strong>{{ eventLabel(row.event) }}</strong
+              ><span v-if="row.event.team_id" class="event-team" :class="row.event.side"
+                ><i v-if="row.event.side" />{{ teamName(row.event.team_id)
+                }}<small v-if="row.event.side">{{ row.event.side }}</small></span
+              >
+            </div>
+          </li>
+        </ol>
+      </section>
     </template>
     <footer class="display-footer">
       <span>RCJV GameMaster</span><span>Fair play. Great robots. Better together.</span
@@ -333,6 +464,186 @@ onBeforeUnmount(() => {
 </template>
 
 <style scoped>
+.display-field-title {
+  display: inline-block;
+  margin-top: 9px;
+  font-size: 12px;
+  font-weight: 700;
+  color: #88c6b6;
+  letter-spacing: 0.03em;
+}
+.event-log {
+  border: 1px solid #243b4c;
+  border-radius: 12px;
+  overflow: hidden;
+  background: #102330;
+  margin-top: 24px;
+}
+.event-log > header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 20px;
+  padding: 18px 22px;
+  border-bottom: 1px solid #243b4c;
+}
+.event-log h2 {
+  margin: 0;
+  font-size: 13px;
+  color: #bfd2dd;
+  font-weight: 650;
+}
+.event-log header > span {
+  color: #607f91;
+  font-size: 9px;
+}
+.event-list {
+  list-style: none;
+  padding: 0;
+  margin: 0;
+  max-height: 310px;
+  overflow: auto;
+  scrollbar-color: #335a6b #102330;
+  scrollbar-width: thin;
+}
+.event-row {
+  display: grid;
+  grid-template-columns: 86px minmax(180px, 0.8fr) minmax(200px, 1.2fr);
+  gap: 20px;
+  align-items: center;
+  padding: 15px 22px;
+  border-bottom: 1px solid #203747;
+}
+.event-row:last-child {
+  border: 0;
+}
+.event-row time {
+  color: #62b99f;
+  font-size: 13px;
+  font-variant-numeric: tabular-nums;
+}
+.event-context,
+.event-action {
+  display: grid;
+  gap: 6px;
+  min-width: 0;
+}
+.event-context > strong {
+  color: #9ebdcb;
+  font-size: 11px;
+  font-weight: 650;
+}
+.event-context > small {
+  font-size: 9px;
+  color: #587d91;
+}
+.event-action > strong {
+  color: #bcd3dc;
+  font-weight: 550;
+  font-size: 12px;
+}
+.event-team {
+  display: flex;
+  align-items: center;
+  gap: 7px;
+  font-size: 10px;
+  color: #7d9eae;
+  overflow-wrap: anywhere;
+}
+.event-team i {
+  width: 7px;
+  height: 7px;
+  border-radius: 50%;
+  display: block;
+  flex-shrink: 0;
+}
+.event-team.blue {
+  color: #77afe4;
+}
+.event-team.blue i {
+  background: #63a5ec;
+}
+.event-team.yellow {
+  color: #d5bd68;
+}
+.event-team.yellow i {
+  background: #e5ca5c;
+}
+.event-team > small {
+  font-size: 8px;
+  text-transform: uppercase;
+  letter-spacing: 0.07em;
+  opacity: 0.7;
+  margin-left: 4px;
+}
+@media (max-width: 600px) {
+  .event-log {
+    margin-top: 16px;
+  }
+  .event-log > header {
+    padding: 16px;
+  }
+  .event-row {
+    grid-template-columns: 60px 1fr;
+    gap: 9px 12px;
+    padding: 14px 16px;
+  }
+  .event-row time {
+    font-size: 10px;
+  }
+  .event-context > small {
+    font-size: 8px;
+  }
+  .event-action {
+    grid-column: 2;
+  }
+  .event-action > strong {
+    font-size: 11px;
+  }
+  .event-log header > span {
+    font-size: 8px;
+  }
+  .display-field-title {
+    font-size: 10px;
+    margin-top: 7px;
+  }
+}
+@media (min-width: 1800px) {
+  .event-log h2 {
+    font-size: 18px;
+  }
+  .event-log header > span {
+    font-size: 12px;
+  }
+  .event-log > header {
+    padding: 22px 28px;
+  }
+  .event-row {
+    padding: 20px 28px;
+    grid-template-columns: 110px minmax(250px, 0.8fr) minmax(250px, 1.2fr);
+  }
+  .event-row time {
+    font-size: 17px;
+  }
+  .event-context > strong {
+    font-size: 14px;
+  }
+  .event-context > small {
+    font-size: 12px;
+  }
+  .event-action > strong {
+    font-size: 16px;
+  }
+  .event-team {
+    font-size: 13px;
+  }
+  .event-team > small {
+    font-size: 10px;
+  }
+  .display-field-title {
+    font-size: 16px;
+  }
+}
 .display-page {
   background: #0d1d2b;
   color: #dbe7ef;
@@ -478,6 +789,9 @@ onBeforeUnmount(() => {
   align-items: center;
   min-height: 290px;
   padding: 25px 0 10px;
+}
+.featured-teams.individual-run {
+  grid-template-columns: minmax(0, 1fr) minmax(110px, 0.7fr);
 }
 .featured-team {
   text-align: center;

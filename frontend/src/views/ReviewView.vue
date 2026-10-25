@@ -20,7 +20,10 @@ const filter = ref('submitted'),
   goals2 = ref(0),
   notes = ref('')
 const matches = computed(
-  () => w.value?.matches.filter((m) => filter.value === 'all' || m.status === filter.value) ?? [],
+  () =>
+    w.value?.matches.filter(
+      (m) => !m.is_placeholder && (filter.value === 'all' || m.status === filter.value),
+    ) ?? [],
 )
 const selectedLeague = computed(() =>
   w.value?.leagues.find((league) => league.id === selected.value?.league_id),
@@ -30,10 +33,17 @@ const editableResult = computed(
     selected.value &&
     !selected.value.is_bye &&
     (['submitted', 'approved'].includes(selected.value.status) ||
-      (!w.value?.leagues.find((l) => l.id === selected.value!.league_id)?.referee_mode &&
+      ((!w.value?.leagues.find((l) => l.id === selected.value!.league_id)?.referee_mode ||
+        individualRun(selected.value)) &&
         ['draft', 'scheduled'].includes(selected.value.status))),
 )
 const pending = computed(() => w.value?.matches.filter((m) => m.status === 'submitted').length ?? 0)
+function individualRun(match: Match) {
+  return (
+    w.value?.stages.find((stage) => stage.id === match.stage_id)?.type === 'individual' ||
+    (!match.is_placeholder && !match.is_bye && !match.team2_id)
+  )
+}
 function opponentName(match: Match) {
   return match.team2_id ? teamName(match.team2_id) : match.is_bye ? 'Bye' : 'Individual run'
 }
@@ -61,8 +71,8 @@ async function review(approve: boolean) {
     await perform(() =>
       api.post(`/matches/${selected.value!.id}/review`, {
         approve,
-        goals1: goals1.value,
-        goals2: goals2.value,
+        goals1: individualRun(selected.value!) ? 0 : goals1.value,
+        goals2: individualRun(selected.value!) ? 0 : goals2.value,
         notes: notes.value,
       }),
     )
@@ -127,7 +137,15 @@ async function review(approve: boolean) {
               <strong>{{ teamName(m.team1_id) }}</strong
               ><small>{{ opponentName(m) }}</small>
             </td>
-            <td class="score-cell">{{ m.goals1 }} : {{ m.goals2 }}</td>
+            <td class="score-cell">
+              {{
+                individualRun(m)
+                  ? m.status === 'approved'
+                    ? 'Completed'
+                    : '—'
+                  : `${m.goals1} : ${m.goals2}`
+              }}
+            </td>
             <td>
               {{ leagueName(m.league_id) }}<small>{{ stageName(m.stage_id) }}</small>
             </td>
@@ -164,7 +182,11 @@ async function review(approve: boolean) {
         </div>
         <button class="icon-button" aria-label="Close report" @click="selected = null">×</button>
       </div>
-      <div class="review-score">
+      <div v-if="individualRun(selected)" class="my-[20px]">
+        <strong>{{ teamName(selected.team1_id) }}</strong>
+        <p class="hint">Individual run. Approve to mark this run completed and publish it.</p>
+      </div>
+      <div v-else class="review-score">
         <label
           >{{ teamName(selected.team1_id)
           }}<input
@@ -203,6 +225,9 @@ async function review(approve: boolean) {
           signed score.</span
         >
         <span v-else>Team and referee signatures refer to this score.</span>
+      </p>
+      <p v-if="selected.live_state?.ended_early" class="audit-notice">
+        <strong>Match ended early.</strong> {{ selected.live_state.end_reason }}
       </p>
       <label
         >Match notes / editor feedback<textarea

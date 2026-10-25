@@ -97,7 +97,14 @@ func (a *API) registerDomainRoutes(v fiber.Router) {
 	registerEntity[domain.Referee](a, v, "referees", validateReferee)
 	registerEntity[domain.Match](a, v, "matches", validateMatch)
 	v.Post("/fields/:id/copy-slots", requireRoles("admin"), a.copySlots)
+	v.Post("/stages/:id/standings/publish", requireRoles("admin", "editor"), a.publishStandings)
+	v.Delete("/stages/:id/standings/publication", requireRoles("admin", "editor"), a.unpublishStandings)
+	v.Put("/leagues/:id/standings-settings", requireRoles("admin", "editor"), a.standingsSettings)
+	v.Post("/stages/:id/prepare", requireRoles("admin"), a.prepareStage)
+	v.Post("/stages/:id/preview", requireRoles("admin"), a.previewGeneration)
 	v.Post("/stages/:id/generate", requireRoles("admin"), a.generate)
+	v.Post("/stages/:id/matches", requireRoles("admin"), a.createStageMatches)
+	v.Post("/stages/:id/clear", requireRoles("admin"), a.clearStage)
 	v.Put("/matches/:id", requireRoles("admin", "editor"), a.updateMatch)
 	v.Post("/matches/:id/schedule", requireRoles("admin", "editor"), a.schedule)
 	v.Post("/matches/:id/review", requireRoles("admin", "editor"), a.review)
@@ -142,7 +149,27 @@ func registerEntity[T any](a *API, v fiber.Router, name string, validate func(*g
 			if e := validate(tx, &row); e != nil {
 				return e
 			}
-			return tx.Create(&row).Error
+			if match, ok := any(&row).(*domain.Match); ok {
+				var stage domain.Stage
+				if err := tx.First(&stage, match.StageID).Error; err != nil {
+					return err
+				}
+				if stage.PreparedTeams > 0 && stage.Type != "manual" {
+					planned, err := attachPlaceholderRows(tx, stage, []domain.Match{*match}, false)
+					if err != nil {
+						return err
+					}
+					if err := savePopulatedMatches(tx, stage, planned); err != nil {
+						return err
+					}
+					*match = planned[0]
+					return nil
+				}
+			}
+			if err := tx.Create(&row).Error; err != nil {
+				return err
+			}
+			return syncEntityPlaceholders(tx, any(&row))
 		})
 		if e != nil {
 			return apiError(c, 400, domainError(e))
@@ -176,11 +203,28 @@ func registerEntity[T any](a *API, v fiber.Router, name string, validate func(*g
 			if league, ok := any(&row).(*domain.League); ok {
 				preserveLeagueSettings(league, any(&old).(*domain.League), c.Body())
 			}
+			if stage, ok := any(&row).(*domain.Stage); ok {
+				stage.PreparedTeams = any(&old).(*domain.Stage).PreparedTeams
+				var fields map[string]json.RawMessage
+				if json.Unmarshal(c.Body(), &fields) == nil {
+					if _, present := fields["expected_teams"]; !present {
+						stage.ExpectedTeams = any(&old).(*domain.Stage).ExpectedTeams
+					}
+				}
+			}
 			if e := validate(tx, &row); e != nil {
 				return e
 			}
 			if e := protectUpdate(tx, name, id, &row, &old); e != nil {
 				return e
+			}
+			if league, ok := any(&row).(*domain.League); ok {
+				previous := any(&old).(*domain.League)
+				if previous.AutoPublishStandings() && !league.AutoPublishStandings() {
+					if err := freezeAutomaticStandings(tx, *previous); err != nil {
+						return err
+					}
+				}
 			}
 			if e := tx.Save(&row).Error; e != nil {
 				return e
@@ -196,10 +240,20 @@ func registerEntity[T any](a *API, v fiber.Router, name string, validate func(*g
 					}
 				}
 				if league.ParentID == nil {
-					return cascadeLeagueControls(tx, league)
+					if err := cascadeLeagueControls(tx, league); err != nil {
+						return err
+					}
 				}
 			}
-			return nil
+			if team, ok := any(&row).(*domain.Team); ok {
+				previous := any(&old).(*domain.Team)
+				if previous.LeagueID != team.LeagueID {
+					if err := syncLeaguePlaceholders(tx, previous.LeagueID); err != nil {
+						return err
+					}
+				}
+			}
+			return syncEntityPlaceholders(tx, any(&row))
 		})
 		if e != nil {
 			return apiError(c, 400, domainError(e))
@@ -223,7 +277,33 @@ func registerEntity[T any](a *API, v fiber.Router, name string, validate func(*g
 			if e := protectDelete(tx, name, id); e != nil {
 				return e
 			}
-			return tx.Delete(&row).Error
+			if name == "stages" {
+				if err := invalidateStandingPublication(tx, id); err != nil {
+					return err
+				}
+			}
+			if match, ok := any(&row).(*domain.Match); ok {
+				if match.Status == "approved" && match.Published {
+					if err := invalidateStandingPublicationForMatch(tx, *match); err != nil {
+						return err
+					}
+				}
+			}
+			if name == "stages" {
+				if err := tx.Where("stage_id = ? AND is_placeholder = ?", id, true).Delete(&domain.Match{}).Error; err != nil {
+					return err
+				}
+			}
+			if err := tx.Delete(&row).Error; err != nil {
+				return err
+			}
+			if team, ok := any(&row).(*domain.Team); ok {
+				return syncLeaguePlaceholders(tx, team.LeagueID)
+			}
+			if match, ok := any(&row).(*domain.Match); ok {
+				return updatePopulatedRound(tx, match.StageID)
+			}
+			return nil
 		})
 		if e != nil {
 			return apiError(c, 409, domainError(e))
@@ -270,6 +350,10 @@ func validateTournament(t *domain.Tournament) error {
 // configuration so toggling inspection or referee mode never erases limits or
 // clocks. A deliberately supplied numeric zero still retains its API meaning.
 func preserveLeagueSettings(next, old *domain.League, body []byte) {
+	if next.StandingsAutoPublish == nil {
+		enabled := old.AutoPublishStandings()
+		next.StandingsAutoPublish = &enabled
+	}
 	if next.InspectionsEnabled == nil {
 		enabled := old.InspectionsRequired()
 		next.InspectionsEnabled = &enabled
@@ -297,6 +381,10 @@ func preserveLeagueSettings(next, old *domain.League, body []byte) {
 	}
 }
 func validateLeague(tx *gorm.DB, l *domain.League) error {
+	if l.StandingsAutoPublish == nil {
+		enabled := true
+		l.StandingsAutoPublish = &enabled
+	}
 	if l.InspectionsEnabled == nil {
 		enabled := true
 		l.InspectionsEnabled = &enabled
@@ -343,7 +431,7 @@ func validateLeague(tx *gorm.DB, l *domain.League) error {
 	if l.ID != 0 && l.RefereeMode {
 		var n int64
 		minimum := (2*l.HalfSeconds + l.HalftimeSeconds + 59) / 60
-		if e := tx.Model(&domain.Match{}).Where("league_id = ? AND scheduled_at IS NOT NULL AND duration_minutes < ?", l.ID, minimum).Count(&n).Error; e != nil {
+		if e := tx.Model(&domain.Match{}).Where("league_id = ? AND scheduled_at IS NOT NULL AND duration_minutes < ? AND stage_id NOT IN (?)", l.ID, minimum, tx.Model(&domain.Stage{}).Select("id").Where("type = ?", "individual")).Count(&n).Error; e != nil {
 			return e
 		}
 		if n > 0 {
@@ -373,12 +461,18 @@ func cascadeLeagueControls(tx *gorm.DB, parent *domain.League) error {
 		if e := tx.Model(&domain.League{}).Where("id = ?", child.ID).Updates(map[string]any{"mode": child.Mode, "referee_mode": child.RefereeMode}).Error; e != nil {
 			return e
 		}
+		if err := syncLeaguePlaceholders(tx, child.ID); err != nil {
+			return err
+		}
 	}
 	return nil
 }
 func validateStage(tx *gorm.DB, s *domain.Stage) error {
-	if s.TeamLimit < 0 || s.TeamLimit == 1 || s.TeamLimit > 256 {
-		return errors.New("team limit must be zero or between 2 and 256")
+	if s.ExpectedTeams < 0 || s.ExpectedTeams == 1 && s.Type != "individual" || s.ExpectedTeams > 256 {
+		return errors.New("expected team count must be zero or within the stage minimum and 256")
+	}
+	if s.TeamLimit < 0 || s.TeamLimit == 1 && s.Type != "individual" || s.TeamLimit > 256 {
+		return errors.New("team limit must be zero or within the stage minimum and 256")
 	}
 	if e := validName(s.Name); e != nil {
 		return e
@@ -387,7 +481,7 @@ func validateStage(tx *gorm.DB, s *domain.Stage) error {
 		return errors.New("league is not in this tournament")
 	}
 	switch s.Type {
-	case "round_robin", "swiss", "knockout", "manual":
+	case "round_robin", "swiss", "knockout", "individual", "manual":
 	default:
 		return errors.New("invalid stage type")
 	}
@@ -475,9 +569,18 @@ func validateReferee(tx *gorm.DB, r *domain.Referee) error {
 	return nil
 }
 func validateMatch(tx *gorm.DB, m *domain.Match) error {
+	m.IsPlaceholder = false
+	if m.Team1ID == 0 {
+		return errors.New("assign a first team; empty matches are prepared by automatic stages")
+	}
 	var s domain.Stage
 	if tx.Where("id = ? AND tournament_id = ?", m.StageID, m.TournamentID).First(&s).Error != nil || s.LeagueID != m.LeagueID {
 		return errors.New("stage is not in this league")
+	}
+	if s.Type == "individual" {
+		if err := validateIndividualAssignment(tx, s.ID, m); err != nil {
+			return err
+		}
 	}
 	var a domain.Team
 	if tx.First(&a, m.Team1ID).Error != nil || a.LeagueID != m.LeagueID {
@@ -493,7 +596,7 @@ func validateMatch(tx *gorm.DB, m *domain.Match) error {
 	if m.DurationMinutes == 0 {
 		m.DurationMinutes = (2*l.HalfSeconds + l.HalftimeSeconds + 59) / 60
 	}
-	if l.RefereeMode && m.DurationMinutes < (2*l.HalfSeconds+l.HalftimeSeconds+59)/60 {
+	if l.RefereeMode && s.Type != "individual" && m.DurationMinutes < (2*l.HalfSeconds+l.HalftimeSeconds+59)/60 {
 		return errors.New("match duration must allow both halves and halftime")
 	}
 	if m.DurationMinutes < 1 || m.DurationMinutes > 1440 {

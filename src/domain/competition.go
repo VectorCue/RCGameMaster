@@ -11,7 +11,7 @@ func Standings(teams []Team, matches []Match, leagueID, stageID uint) []Standing
 	participants := map[uint]bool{}
 	if stageID != 0 {
 		for _, m := range matches {
-			if m.LeagueID == leagueID && m.StageID == stageID {
+			if !m.IsPlaceholder && m.Team1ID != 0 && m.LeagueID == leagueID && m.StageID == stageID {
 				participants[m.Team1ID] = true
 				if m.Team2ID != nil {
 					participants[*m.Team2ID] = true
@@ -26,7 +26,7 @@ func Standings(teams []Team, matches []Match, leagueID, stageID uint) []Standing
 		}
 	}
 	for _, m := range matches {
-		if m.LeagueID != leagueID || (stageID != 0 && m.StageID != stageID) || m.Status != "approved" {
+		if m.IsPlaceholder || m.Team1ID == 0 || m.LeagueID != leagueID || (stageID != 0 && m.StageID != stageID) || m.Status != "approved" {
 			continue
 		}
 		a := rows[m.Team1ID]
@@ -135,6 +135,9 @@ func SwissPairs(ranked []uint, previous []Match, round int) ([]Pair, error) {
 	met := map[[2]uint]bool{}
 	byes := map[uint]bool{}
 	for _, m := range previous {
+		if m.IsPlaceholder || m.Team1ID == 0 {
+			continue
+		}
 		if m.Team2ID == nil {
 			byes[m.Team1ID] = true
 			continue

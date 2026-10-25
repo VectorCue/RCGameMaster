@@ -43,17 +43,20 @@ type RobotTimeout struct {
 }
 
 type LiveState struct {
-	Checks           []RobotCheck     `json:"checks"`
-	Phase            string           `json:"phase"`
-	RemainingSeconds int              `json:"remaining_seconds"`
-	Running          bool             `json:"running"`
-	StartedAt        *time.Time       `json:"started_at"`
-	BlueTeamID       *uint            `json:"blue_team_id"`
-	KickoffTeamID    *uint            `json:"kickoff_team_id"`
-	Timeouts         []RobotTimeout   `json:"timeouts"`
-	Signatures       []MatchSignature `json:"signatures"`
-	SignedGoals1     *int             `json:"signed_goals1,omitempty"`
-	SignedGoals2     *int             `json:"signed_goals2,omitempty"`
+	Checks           []RobotCheck        `json:"checks"`
+	Phase            string              `json:"phase"`
+	RemainingSeconds int                 `json:"remaining_seconds"`
+	Running          bool                `json:"running"`
+	StartedAt        *time.Time          `json:"started_at"`
+	BlueTeamID       *uint               `json:"blue_team_id"`
+	KickoffTeamID    *uint               `json:"kickoff_team_id"`
+	Timeouts         []RobotTimeout      `json:"timeouts"`
+	Signatures       []MatchSignature    `json:"signatures"`
+	SignedGoals1     *int                `json:"signed_goals1,omitempty"`
+	SignedGoals2     *int                `json:"signed_goals2,omitempty"`
+	Events           []domain.MatchEvent `json:"events"`
+	EndedEarly       bool                `json:"ended_early"`
+	EndReason        string              `json:"end_reason,omitempty"`
 }
 
 type matchCommand struct {
@@ -66,6 +69,8 @@ type matchCommand struct {
 	Delta         int              `json:"delta"`
 	Signatures    []MatchSignature `json:"signatures"`
 	Notes         string           `json:"notes"`
+	Force         bool             `json:"force"`
+	Reason        string           `json:"reason"`
 }
 
 func (a *API) registerMatchRoutes(v1 fiber.Router) {
@@ -90,6 +95,7 @@ func (a *API) getMatch(c fiber.Ctx) error {
 		return c.Status(500).JSON(fiber.Map{"error": "Could not load match state."})
 	}
 	match.LiveState, _ = json.Marshal(state)
+	c.Set("X-Server-Time", time.Now().UTC().Format(time.RFC3339Nano))
 	return c.JSON(match)
 }
 
@@ -140,8 +146,9 @@ func (a *API) controlMatch(c fiber.Ctx) error {
 			return fiber.NewError(409, "Referee mode is disabled for this league.")
 		}
 		if match.Team2ID == nil {
-			return fiber.NewError(409, "A bye cannot be refereed.")
+			return fiber.NewError(409, "Single-team runs use editor result entry; byes cannot be refereed.")
 		}
+
 		if match.Status == "approved" || match.Status == "submitted" {
 			return fiber.NewError(409, "This result is locked for review.")
 		}
@@ -169,11 +176,12 @@ func (a *API) controlMatch(c fiber.Ctx) error {
 		requestLogger(c.Context()).Error("match.control_failed", "match_id", id, "error", err)
 		return c.Status(500).JSON(fiber.Map{"error": "Could not save match. Please try again."})
 	}
+	c.Set("X-Server-Time", time.Now().UTC().Format(time.RFC3339Nano))
 	return c.JSON(match)
 }
 
 func readLiveState(raw json.RawMessage) (LiveState, error) {
-	state := LiveState{Phase: "pregame", Checks: []RobotCheck{}, Timeouts: []RobotTimeout{}, Signatures: []MatchSignature{}}
+	state := LiveState{Phase: "pregame", Checks: []RobotCheck{}, Timeouts: []RobotTimeout{}, Signatures: []MatchSignature{}, Events: []domain.MatchEvent{}}
 	if len(raw) > 0 && string(raw) != "null" {
 		if err := json.Unmarshal(raw, &state); err != nil {
 			return state, err
@@ -181,6 +189,9 @@ func readLiveState(raw json.RawMessage) (LiveState, error) {
 	}
 	if state.Phase == "" {
 		state.Phase = "pregame"
+	}
+	if state.Events == nil {
+		state.Events = []domain.MatchEvent{}
 	}
 	return state, nil
 }
@@ -228,6 +239,12 @@ func clockRemaining(state *LiveState, now time.Time) int {
 }
 
 func applyMatchCommand(match *domain.Match, league *domain.League, state *LiveState, cmd matchCommand, now time.Time) error {
+	if match.IsPlaceholder || match.Team1ID == 0 {
+		return errors.New("assign teams before opening referee control for this empty match")
+	}
+	beforePhase, beforeRemaining := state.Phase, clockRemaining(state, now)
+	eventType, nextPhase := "", ""
+	forced := false
 	switch cmd.Action {
 	case "checks":
 		if !league.InspectionsRequired() {
@@ -285,6 +302,7 @@ func applyMatchCommand(match *domain.Match, league *domain.League, state *LiveSt
 			state.RemainingSeconds = league.HalfSeconds
 			state.Phase = "first_half"
 			match.Status = "in_progress"
+			eventType = "match_started"
 		} else if state.Phase != "first_half" && state.Phase != "halftime" && state.Phase != "second_half" {
 			if !league.InspectionsRequired() {
 				return errors.New("Choose sides and kickoff before starting.")
@@ -295,16 +313,27 @@ func applyMatchCommand(match *domain.Match, league *domain.League, state *LiveSt
 			return errors.New("This period is finished. Advance to the next period.")
 		}
 		state.Running, state.StartedAt = true, &now
+		if eventType == "" {
+			eventType = "clock_started"
+		}
 	case "pause":
 		if !state.Running {
 			return errors.New("The clock is already paused.")
 		}
 		state.RemainingSeconds = clockRemaining(state, now)
 		state.Running, state.StartedAt = false, nil
+		eventType = "clock_paused"
 	case "advance":
-		if clockRemaining(state, now) > 0 {
+		if beforeRemaining > 0 && !cmd.Force {
 			return errors.New("Wait until this period ends before advancing.")
 		}
+		if state.Phase != "first_half" && state.Phase != "halftime" && state.Phase != "second_half" {
+			return errors.New("There is no active period to advance.")
+		}
+		if len(cmd.Reason) > 1000 {
+			return errors.New("The reason must be fewer than 1,000 characters.")
+		}
+		forced = cmd.Force && beforeRemaining > 0
 		state.Running, state.StartedAt = false, nil
 		switch state.Phase {
 		case "first_half":
@@ -319,9 +348,38 @@ func applyMatchCommand(match *domain.Match, league *domain.League, state *LiveSt
 			state.KickoffTeamID = otherTeam(match, state.KickoffTeamID)
 		case "second_half":
 			state.Phase, state.RemainingSeconds = "finished", 0
+			if forced {
+				state.EndedEarly = true
+				state.EndReason = strings.TrimSpace(cmd.Reason)
+				if state.EndReason == "" {
+					state.EndReason = "The second half was ended before the clock elapsed."
+				}
+			}
 		default:
 			return errors.New("There is no completed period to advance.")
 		}
+		nextPhase = state.Phase
+		eventType = "period_advanced"
+		if state.Phase == "finished" {
+			eventType = "match_ended"
+			if state.EndedEarly {
+				eventType = "match_ended_early"
+			}
+		}
+	case "finish_early":
+		if state.Phase != "first_half" && state.Phase != "halftime" && state.Phase != "second_half" {
+			return errors.New("Only a match that has started can be ended early.")
+		}
+		reason := strings.TrimSpace(cmd.Reason)
+		if reason == "" || len(reason) > 1000 {
+			return errors.New("Enter a reason for ending the match early (up to 1,000 characters).")
+		}
+		state.Phase, state.RemainingSeconds = "finished", 0
+		state.Running, state.StartedAt = false, nil
+		state.EndedEarly, state.EndReason = true, reason
+		state.Signatures = []MatchSignature{}
+		state.SignedGoals1, state.SignedGoals2 = nil, nil
+		eventType, nextPhase = "match_ended_early", "finished"
 	case "goal":
 		if state.Phase != "first_half" && state.Phase != "second_half" && state.Phase != "finished" {
 			return errors.New("Goals can only be changed during or after play.")
@@ -342,6 +400,10 @@ func applyMatchCommand(match *domain.Match, league *domain.League, state *LiveSt
 		}
 		state.Signatures = []MatchSignature{}
 		state.SignedGoals1, state.SignedGoals2 = nil, nil
+		eventType = "goal"
+		if cmd.Delta < 0 {
+			eventType = "goal_removed"
+		}
 	case "timeout":
 		if state.Phase != "first_half" && state.Phase != "second_half" {
 			return errors.New("Robot timeouts are available during play.")
@@ -361,6 +423,29 @@ func applyMatchCommand(match *domain.Match, league *domain.League, state *LiveSt
 		if !found {
 			state.Timeouts = append(state.Timeouts, timeout)
 		}
+		eventType = "robot_timeout"
+		if found {
+			eventType = "robot_timeout_reset"
+		}
+	case "timeout_clear":
+		if state.Phase != "first_half" && state.Phase != "second_half" {
+			return errors.New("Robot timeouts are available during play.")
+		}
+		if !matchTeam(match, cmd.TeamID) || cmd.Robot < 1 || cmd.Robot > league.RobotCount {
+			return errors.New("Choose a robot belonging to a team in this match.")
+		}
+		found := false
+		for i, item := range state.Timeouts {
+			if item.TeamID == cmd.TeamID && item.Robot == cmd.Robot {
+				state.Timeouts = slices.Delete(state.Timeouts, i, i+1)
+				found = true
+				break
+			}
+		}
+		if !found {
+			return errors.New("This robot is not in a timeout.")
+		}
+		eventType = "robot_returned"
 	case "submit":
 		if state.Phase != "finished" {
 			return errors.New("Finish both halves before submitting the result.")
@@ -380,6 +465,28 @@ func applyMatchCommand(match *domain.Match, league *domain.League, state *LiveSt
 		match.Status = "submitted"
 	default:
 		return errors.New("Unknown match command.")
+	}
+	if eventType != "" {
+		eventPhase, eventRemaining := beforePhase, beforeRemaining
+		if eventType == "match_started" {
+			eventPhase, eventRemaining = state.Phase, clockRemaining(state, now)
+		}
+		id := uint(1)
+		if len(state.Events) > 0 {
+			id = state.Events[len(state.Events)-1].ID + 1
+		}
+		side := ""
+		if matchTeam(match, cmd.TeamID) && state.BlueTeamID != nil {
+			side = "yellow"
+			if *state.BlueTeamID == cmd.TeamID {
+				side = "blue"
+			}
+		}
+		state.Events = append(state.Events, domain.MatchEvent{
+			ID: id, At: now.UTC(), Type: eventType, Phase: eventPhase,
+			RemainingSeconds: eventRemaining, TeamID: cmd.TeamID, Robot: cmd.Robot,
+			Side: side, NextPhase: nextPhase, Forced: forced,
+		})
 	}
 	return nil
 }

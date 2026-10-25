@@ -17,50 +17,54 @@ const {
 } = useWorkspace()
 const leagueFilter = ref(0),
   stageFilter = ref(0),
-  selectedDay = ref(''),
-  showCreate = ref(false),
-  showGenerate = ref(false)
-const generateStage = ref(0),
-  generateRound = ref(1)
-const manual = ref({
-  stage_id: 0,
-  league_id: 0,
-  team1_id: 0,
-  team2_id: null as number | null,
-  duration_minutes: 25,
-  round: 1,
-})
+  selectedDay = ref('')
+const restoredTournamentId = ref<number | null>(null)
+const workspaceReady = computed(() => w.value?.tournament.id === tournamentId.value)
+const mainLeagues = computed(() => w.value?.leagues.filter((league) => !league.parent_id) ?? [])
+const availableStages = computed(
+  () => w.value?.stages.filter((stage) => leagueMatches(stage.league_id)) ?? [],
+)
 const selected = ref<Match | null>(null),
   selectedSlot = ref<number | null>(null),
   selectedRefs = ref<number[]>([]),
   dragId = ref<number | null>(null),
   dropTarget = ref<number | null>(null)
-const selectedStage = computed(() => w.value?.stages.find((s) => s.id === manual.value.stage_id))
-const manualLeague = computed(() =>
-  w.value?.leagues.find((l) => l.id === selectedStage.value?.league_id),
-)
 const canEditMetadata = computed(
   () => selected.value && ['draft', 'scheduled'].includes(selected.value.status),
 )
-watch(selectedStage, (next, previous) => {
-  if (next?.league_id !== previous?.league_id) {
-    manual.value.team1_id = 0
-    manual.value.team2_id = null
-  }
-  const league = w.value?.leagues.find((l) => l.id === next?.league_id)
-  if (league)
-    manual.value.duration_minutes = Math.ceil(
-      (2 * league.half_seconds + league.halftime_seconds) / 60,
-    )
+const selectedStage = computed(() =>
+  w.value?.stages.find((stage) => stage.id === selected.value?.stage_id),
+)
+const originalStage = computed(() => {
+  const original = w.value?.matches.find((match) => match.id === selected.value?.id)
+  return w.value?.stages.find((stage) => stage.id === original?.stage_id)
 })
-function toggleCreate() {
-  showCreate.value = !showCreate.value
-  showGenerate.value = false
-}
-function toggleGenerate() {
-  showGenerate.value = !showGenerate.value
-  showCreate.value = false
-}
+const stageMetadataLocked = computed(
+  () => !!selected.value?.is_placeholder || originalStage.value?.type !== 'manual',
+)
+const metadataStages = computed(() =>
+  stageMetadataLocked.value
+    ? originalStage.value
+      ? [originalStage.value]
+      : []
+    : (w.value?.stages.filter(
+        (stage) => stage.league_id === selected.value?.league_id && stage.type === 'manual',
+      ) ?? []),
+)
+const selectedIsIndividual = computed(() => selectedStage.value?.type === 'individual')
+const selectedAllowsNoOpponent = computed(
+  () =>
+    selectedStage.value?.type === 'manual' &&
+    w.value?.leagues.find((league) => league.id === selected.value?.league_id)?.mode ===
+      'scheduling',
+)
+watch(
+  () => selected.value?.stage_id,
+  () => {
+    if (selected.value && selectedIsIndividual.value) selected.value.team2_id = null
+  },
+  { flush: 'sync' },
+)
 function endDrag() {
   dragId.value = null
   dropTarget.value = null
@@ -79,11 +83,41 @@ function dateKey(value: string) {
   return `${parts.find((p) => p.type === 'year')?.value}-${parts.find((p) => p.type === 'month')?.value}-${parts.find((p) => p.type === 'day')?.value}`
 }
 function leagueMatches(id: number) {
-  return (
-    !leagueFilter.value ||
-    id === leagueFilter.value ||
-    w.value?.leagues.find((l) => l.id === id)?.parent_id === leagueFilter.value
-  )
+  if (!leagueFilter.value) return true
+  const seen = new Set<number>()
+  let current = w.value?.leagues.find((league) => league.id === id)
+  while (current && !seen.has(current.id)) {
+    if (current.id === leagueFilter.value) return true
+    seen.add(current.id)
+    current = w.value?.leagues.find((league) => league.id === current?.parent_id)
+  }
+  return false
+}
+function storageKey(id: number) {
+  return `schedule.mainLeague.${id}`
+}
+function restoreMainLeague(id: number) {
+  try {
+    const saved = localStorage.getItem(storageKey(id))
+    if (saved === null) return 0
+    const value = /^(0|[1-9]\d*)$/.test(saved) ? Number(saved) : NaN
+    if (
+      Number.isSafeInteger(value) &&
+      (value === 0 || mainLeagues.value.some((league) => league.id === value))
+    )
+      return value
+    localStorage.removeItem(storageKey(id))
+  } catch {
+    /* Filtering remains available when browser storage is disabled. */
+  }
+  return 0
+}
+function persistMainLeague(id: number, value: number) {
+  try {
+    localStorage.setItem(storageKey(id), String(value))
+  } catch {
+    /* Keep the in-memory selection. */
+  }
 }
 const filteredMatches = computed(
   () =>
@@ -92,14 +126,44 @@ const filteredMatches = computed(
     ) ?? [],
 )
 const fields = computed(
-  () =>
-    w.value?.fields.filter(
-      (f) =>
-        leagueMatches(f.league_id) ||
-        (leagueFilter.value &&
-          w.value?.leagues.find((l) => l.id === leagueFilter.value)?.parent_id === f.league_id),
-    ) ?? [],
+  () => w.value?.fields.filter((field) => leagueMatches(field.league_id)) ?? [],
 )
+watch(
+  [tournamentId, w],
+  ([id, workspace]) => {
+    if (!workspace || workspace.tournament.id !== id) {
+      restoredTournamentId.value = null
+      return
+    }
+    if (restoredTournamentId.value !== id) {
+      restoredTournamentId.value = id
+      leagueFilter.value = restoreMainLeague(id)
+      stageFilter.value = 0
+      selectedDay.value = ''
+      selected.value = null
+      selectedSlot.value = null
+      endDrag()
+    } else if (
+      leagueFilter.value &&
+      !mainLeagues.value.some((league) => league.id === leagueFilter.value)
+    ) {
+      leagueFilter.value = 0
+      persistMainLeague(id, 0)
+    }
+    if (stageFilter.value && !availableStages.value.some((stage) => stage.id === stageFilter.value))
+      stageFilter.value = 0
+  },
+  { immediate: true },
+)
+watch(leagueFilter, (value) => {
+  stageFilter.value = 0
+  selectedDay.value = ''
+  selectedSlot.value = null
+  selected.value = null
+  endDrag()
+  if (workspaceReady.value && restoredTournamentId.value === tournamentId.value)
+    persistMainLeague(tournamentId.value, value)
+})
 const allSlots = computed(
   () => w.value?.slots.filter((s) => fields.value.some((f) => f.id === s.field_id)) ?? [],
 )
@@ -122,13 +186,32 @@ const eligibleSlots = computed(
     }) ?? [],
 )
 function opponentName(match: Match) {
+  if (match.is_placeholder) return 'TBD'
   return match.team2_id ? teamName(match.team2_id) : match.is_bye ? 'Bye' : 'Individual run'
+}
+function isIndividualMatch(match: Match) {
+  return w.value?.stages.find((stage) => stage.id === match.stage_id)?.type === 'individual'
+}
+function firstTeamName(match: Match) {
+  return match.is_placeholder
+    ? isIndividualMatch(match)
+      ? 'Awaiting team'
+      : 'Awaiting teams'
+    : teamName(match.team1_id)
 }
 function slotAt(fieldId: number, time: string) {
   return daySlots.value.find((s) => s.field_id === fieldId && s.starts_at === time)
 }
 function matchAt(slotId: number) {
   return w.value?.matches.find((m) => m.slot_id === slotId)
+}
+function matchVisibleAt(slotId: number) {
+  const match = matchAt(slotId)
+  return (
+    !!match &&
+    leagueMatches(match.league_id) &&
+    (!stageFilter.value || match.stage_id === stageFilter.value)
+  )
 }
 function openMatch(match: Match, slotId?: number) {
   if (!canEdit.value) return
@@ -152,6 +235,7 @@ function drop(event: DragEvent, slot: Slot) {
 }
 async function saveAssignment() {
   if (!selected.value) return
+  if (selectedIsIndividual.value) selected.value.team2_id = null
   if (
     await perform(async () => {
       if (canEditMetadata.value) await api.put(`/matches/${selected.value!.id}`, selected.value)
@@ -173,27 +257,6 @@ async function deleteMatch() {
     (await perform(() => api.delete(`/matches/${selected.value!.id}`)))
   )
     selected.value = null
-}
-async function generate() {
-  if (
-    await perform(() =>
-      api.post(`/stages/${generateStage.value}/generate`, { round: generateRound.value }),
-    )
-  )
-    showGenerate.value = false
-}
-async function createMatch() {
-  const stage = selectedStage.value
-  if (!stage) return
-  if (
-    await perform(() =>
-      api.post(`/tournaments/${tournamentId.value}/matches`, {
-        ...manual.value,
-        league_id: stage.league_id,
-      }),
-    )
-  )
-    showCreate.value = false
 }
 function refereeAvailability(referee: Referee) {
   const slot = targetSlot.value
@@ -234,112 +297,20 @@ function dayLabel(value: string) {
     </div>
     <div class="button-group flex flex-wrap items-center gap-[9px]">
       <button class="button" :disabled="loading" @click="reload">↻ Refresh</button>
-      <button v-if="canAdmin" class="button" @click="toggleCreate">＋ Add match</button
-      ><button v-if="canAdmin" class="button primary" @click="toggleGenerate">
-        ✣ Generate pairings
-      </button>
+      <RouterLink
+        :to="{
+          name: 'stage-games',
+          params: { id: tournamentId },
+          query: stageFilter ? { stage: stageFilter } : {},
+        }"
+        class="button primary"
+        >Stage games →</RouterLink
+      >
     </div>
   </div>
   <p v-if="error" class="error" role="alert">{{ error }}</p>
-  <div v-if="loading && !w" class="loading">Loading match schedule…</div>
-  <template v-if="w">
-    <form
-      v-if="showGenerate && canAdmin"
-      class="panel form-grid inline-form"
-      @submit.prevent="generate"
-    >
-      <h2 class="full-width">Generate stage pairings</h2>
-      <label
-        >Stage<select v-model="generateStage" required>
-          <option :value="0" disabled>Select stage</option>
-          <option
-            v-for="s in w.stages.filter((s) => s.type !== 'manual')"
-            :key="s.id"
-            :value="s.id"
-          >
-            {{ leagueName(s.league_id) }} / {{ s.name }} ({{ s.type.replace('_', ' ') }})
-          </option>
-        </select></label
-      ><label
-        >Round (Swiss / knockout)<input
-          v-model.number="generateRound"
-          type="number"
-          min="1"
-          required
-      /></label>
-      <p class="hint full-width">
-        Swiss pairings use approved standings and avoid repeat opponents. Finish and approve the
-        previous round before generating the next one.
-      </p>
-      <div class="form-actions col-span-full flex flex-wrap gap-[10px]">
-        <button class="button primary" :disabled="busy || !generateStage">Generate matches</button
-        ><button type="button" class="button" @click="showGenerate = false">Cancel</button>
-      </div>
-    </form>
-    <form
-      v-if="showCreate && canAdmin"
-      class="panel form-grid inline-form"
-      @submit.prevent="createMatch"
-    >
-      <h2 class="full-width">Create a match</h2>
-      <label
-        >Stage<select v-model="manual.stage_id" required>
-          <option :value="0" disabled>Select stage</option>
-          <option v-for="s in w.stages" :key="s.id" :value="s.id">
-            {{ leagueName(s.league_id) }} / {{ s.name }}
-          </option>
-        </select></label
-      ><label
-        >Duration (minutes)<input
-          v-model.number="manual.duration_minutes"
-          type="number"
-          min="1"
-          required /></label
-      ><label
-        >Team 1<select v-model="manual.team1_id" required>
-          <option :value="0" disabled>Select team</option>
-          <option
-            v-for="t in w.teams.filter((t) => t.league_id === selectedStage?.league_id)"
-            :key="t.id"
-            :value="t.id"
-          >
-            {{ t.name }}
-          </option>
-        </select></label
-      ><label
-        >Team 2<select v-model="manual.team2_id">
-          <option :value="null" :disabled="manualLeague?.mode !== 'scheduling'">
-            {{
-              manualLeague?.mode === 'scheduling'
-                ? 'Individual run (no opponent)'
-                : 'Select opponent'
-            }}
-          </option>
-          <option
-            v-for="t in w.teams.filter(
-              (t) => t.league_id === selectedStage?.league_id && t.id !== manual.team1_id,
-            )"
-            :key="t.id"
-            :value="t.id"
-          >
-            {{ t.name }}
-          </option>
-        </select></label
-      ><label>Round<input v-model.number="manual.round" type="number" min="1" required /></label>
-      <div class="form-actions col-span-full flex flex-wrap gap-[10px]">
-        <button
-          class="button primary"
-          :disabled="
-            busy ||
-            !manual.stage_id ||
-            !manual.team1_id ||
-            (manualLeague?.mode !== 'scheduling' && !manual.team2_id)
-          "
-        >
-          Create match</button
-        ><button type="button" class="button" @click="showCreate = false">Cancel</button>
-      </div>
-    </form>
+  <div v-if="loading && !workspaceReady" class="loading">Loading match schedule…</div>
+  <template v-if="w && workspaceReady">
     <div class="schedule-summary">
       <span
         ><strong>{{ filteredMatches.length }}</strong> total matches</span
@@ -359,21 +330,17 @@ function dayLabel(value: string) {
       </div>
       <div class="filter-group">
         <label
-          ><span class="sr-only">League filter</span
-          ><select v-model="leagueFilter" @change="stageFilter = 0">
-            <option :value="0">All leagues</option>
-            <option v-for="l in w.leagues" :key="l.id" :value="l.id">{{ l.name }}</option>
+          ><span class="sr-only">Main league</span
+          ><select v-model="leagueFilter" aria-label="Main league">
+            <option :value="0">All main leagues</option>
+            <option v-for="l in mainLeagues" :key="l.id" :value="l.id">{{ l.name }}</option>
           </select></label
         ><label
           ><span class="sr-only">Stage filter</span
           ><select v-model="stageFilter">
             <option :value="0">All stages</option>
-            <option
-              v-for="s in w.stages.filter((s) => leagueMatches(s.league_id))"
-              :key="s.id"
-              :value="s.id"
-            >
-              {{ s.name }}
+            <option v-for="s in availableStages" :key="s.id" :value="s.id">
+              {{ leagueName(s.league_id) }} · {{ s.name }}
             </option>
           </select></label
         >
@@ -426,7 +393,7 @@ function dayLabel(value: string) {
               >
                 <template v-if="slotAt(f.id, time)"
                   ><article
-                    v-if="matchAt(slotAt(f.id, time)!.id)"
+                    v-if="matchVisibleAt(slotAt(f.id, time)!.id)"
                     class="match-card"
                     :class="{ published: matchAt(slotAt(f.id, time)!.id)!.published }"
                     :draggable="canEdit"
@@ -443,10 +410,19 @@ function dayLabel(value: string) {
                         <span>{{
                           stageName(matchAt(slotAt(f.id, time)!.id)!.stage_id)
                         }}</span></span
-                      ><strong>{{ teamName(matchAt(slotAt(f.id, time)!.id)!.team1_id) }}</strong
-                      ><span class="versus">vs</span
-                      ><strong>{{ opponentName(matchAt(slotAt(f.id, time)!.id)!) }}</strong
-                      ><small>{{
+                      ><strong>{{ firstTeamName(matchAt(slotAt(f.id, time)!.id)!) }}</strong
+                      ><span
+                        v-if="isIndividualMatch(matchAt(slotAt(f.id, time)!.id)!)"
+                        class="versus"
+                        >Individual run</span
+                      >
+                      <template v-else
+                        ><span class="versus">vs</span
+                        ><strong>{{
+                          opponentName(matchAt(slotAt(f.id, time)!.id)!)
+                        }}</strong></template
+                      >
+                      <small>{{
                         (matchAt(slotAt(f.id, time)!.id)!.referee_ids ?? [])
                           .map((id) => w!.referees.find((r) => r.id === id)?.name)
                           .filter(Boolean)
@@ -470,6 +446,9 @@ function dayLabel(value: string) {
                       </button>
                     </div>
                   </article>
+                  <div v-else-if="matchAt(slotAt(f.id, time)!.id)" class="empty-slot muted">
+                    Occupied by another stage
+                  </div>
                   <button
                     v-else-if="canEdit"
                     class="empty-slot"
@@ -520,9 +499,10 @@ function dayLabel(value: string) {
             <span class="match-meta"
               >#{{ m.number }}
               <span>{{ m.duration_minutes }} min <span v-if="canEdit">⠿</span></span></span
-            ><strong>{{ teamName(m.team1_id) }}</strong
-            ><span class="versus"
-              >vs {{ m.team2_id ? teamName(m.team2_id) : 'Individual run' }}</span
+            ><strong>{{ firstTeamName(m) }}</strong
+            ><span class="versus">{{
+              isIndividualMatch(m) ? 'Individual run' : `vs ${opponentName(m)}`
+            }}</span
             ><small>{{ leagueName(m.league_id) }} · {{ stageName(m.stage_id) }}</small>
           </button>
         </article>
@@ -532,27 +512,24 @@ function dayLabel(value: string) {
       </aside>
     </div>
   </template>
-  <div v-if="selected && w" class="modal-backdrop" @click.self="selected = null">
+  <div v-if="selected && w && workspaceReady" class="modal-backdrop" @click.self="selected = null">
     <section class="modal panel" role="dialog" aria-modal="true" aria-labelledby="assign-title">
       <div class="section-title flex items-center justify-between gap-[12px]">
         <h2 id="assign-title">Assign match #{{ selected.number }}</h2>
         <button class="icon-button" aria-label="Close" @click="selected = null">×</button>
       </div>
       <p class="match-title">
-        {{ teamName(selected.team1_id) }} <span class="muted">vs</span>
-        {{ opponentName(selected) }}
+        {{ firstTeamName(selected) }}
+        <span class="muted">{{ isIndividualMatch(selected) ? '· Individual run' : 'vs' }}</span>
+        <template v-if="!isIndividualMatch(selected)">{{ opponentName(selected) }}</template>
       </p>
       <form class="stack" @submit.prevent="saveAssignment">
         <details v-if="canEditMetadata" class="metadata-editor">
           <summary>Edit match details</summary>
           <div class="form-grid">
             <label
-              >Stage<select v-model="selected.stage_id">
-                <option
-                  v-for="s in w.stages.filter((s) => s.league_id === selected!.league_id)"
-                  :key="s.id"
-                  :value="s.id"
-                >
+              >Stage<select v-model="selected.stage_id" :disabled="stageMetadataLocked">
+                <option v-for="s in metadataStages" :key="s.id" :value="s.id">
                   {{ s.name }}
                 </option>
               </select></label
@@ -563,7 +540,7 @@ function dayLabel(value: string) {
                 min="1"
                 max="1440"
                 required /></label
-            ><label
+            ><label v-if="!selected.is_placeholder"
               >Team 1<select v-model="selected.team1_id" required>
                 <option
                   v-for="t in w.teams.filter(
@@ -575,13 +552,10 @@ function dayLabel(value: string) {
                   {{ t.name }}
                 </option>
               </select></label
-            ><label
+            ><label v-if="!selected.is_placeholder && !selectedIsIndividual"
               >Team 2<select v-model="selected.team2_id">
-                <option
-                  v-if="w.leagues.find((l) => l.id === selected!.league_id)?.mode === 'scheduling'"
-                  :value="null"
-                >
-                  Individual run
+                <option :value="null" :disabled="!selectedAllowsNoOpponent">
+                  {{ selectedAllowsNoOpponent ? 'Individual run' : 'Select opponent' }}
                 </option>
                 <option
                   v-for="t in w.teams.filter(
@@ -594,11 +568,23 @@ function dayLabel(value: string) {
                 </option>
               </select></label
             ><label
-              >Round<input v-model.number="selected.round" type="number" min="1" required /></label
+              >Round<input
+                v-model.number="selected.round"
+                type="number"
+                min="1"
+                required
+                :disabled="selected.is_placeholder" /></label
             ><label class="full-width"
               >Notes<textarea v-model="selected.notes" rows="2"></textarea>
             </label>
           </div>
+          <p v-if="selected.is_placeholder" class="hint">
+            {{ selectedIsIndividual ? 'The team will be filled' : 'Teams will be filled' }} from
+            Stage games. This booking stays reserved for the same stage and round.
+          </p>
+          <p v-else-if="selectedIsIndividual" class="hint">
+            Individual runs have one team and no opponent.
+          </p>
         </details>
         <label
           >Timeslot<select v-model="selectedSlot">
@@ -640,7 +626,7 @@ function dayLabel(value: string) {
           <button class="button primary" :disabled="busy">Save assignment</button
           ><button type="button" class="button" @click="selected = null">Cancel</button
           ><button
-            v-if="canAdmin"
+            v-if="canAdmin && !selected.is_placeholder"
             type="button"
             class="button danger"
             :disabled="busy"

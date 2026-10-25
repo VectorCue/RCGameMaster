@@ -23,6 +23,8 @@ const kickoffTeam = ref(0)
 const signatures = ref<Signature[]>([])
 const signatureIndex = ref(0)
 const notes = ref('')
+const endDialog = ref<HTMLDialogElement>()
+const endReason = ref('')
 let tick: ReturnType<typeof setInterval> | undefined
 let poll: ReturnType<typeof setInterval> | undefined
 let dirtySignatures = false
@@ -42,6 +44,11 @@ const emptyState: LiveState = {
 }
 const live = computed<LiveState>(() => ({ ...emptyState, ...match.value?.live_state }))
 const league = computed(() => workspace.value?.leagues.find((l) => l.id === match.value?.league_id))
+const individualRun = computed(
+  () =>
+    workspace.value?.stages.find((stage) => stage.id === match.value?.stage_id)?.type ===
+    'individual',
+)
 const inspectionsRequired = computed(() => league.value?.inspections_enabled !== false)
 const teamIds = computed(() =>
   match.value
@@ -57,6 +64,15 @@ const selectedCheck = computed(() =>
 const isPregame = computed(() => live.value.phase === 'pregame')
 const isLocked = computed(() => ['submitted', 'approved'].includes(match.value?.status || ''))
 const isHalf = computed(() => ['first_half', 'second_half'].includes(live.value.phase))
+const isActivePeriod = computed(() =>
+  ['first_half', 'halftime', 'second_half'].includes(live.value.phase),
+)
+const nextPeriodName = computed(
+  () =>
+    ({ first_half: 'half-time', halftime: 'the second half', second_half: 'full time' })[
+      live.value.phase as 'first_half' | 'halftime' | 'second_half'
+    ] || 'the next period',
+)
 const canChangeScore = computed(() => isHalf.value || live.value.phase === 'finished')
 const remaining = computed(() => {
   const elapsed =
@@ -77,7 +93,7 @@ const phaseName = computed(
       first_half: 'First half',
       halftime: 'Half-time break',
       second_half: 'Second half',
-      finished: 'Full time',
+      finished: live.value.ended_early ? 'Match ended early' : 'Full time',
     })[live.value.phase],
 )
 const activeSignature = computed(() => signatures.value[signatureIndex.value])
@@ -132,10 +148,10 @@ function timeoutRemaining(team: number, robot: number) {
 function timeoutLabel(team: number, robot: number) {
   const seconds = timeoutRemaining(team, robot)
   return seconds === null
-    ? '1 min timeout'
+    ? 'Start 1:00 timeout'
     : seconds === 0
-      ? 'Ready to return · tap to reset'
-      : `${clock(seconds)} · tap to reset`
+      ? 'Ready to return · tap to restart'
+      : `${clock(seconds)} remaining · tap to restart`
 }
 function selectInspectionTeam(id: number) {
   selectedTeam.value = id
@@ -275,6 +291,26 @@ async function setup() {
 async function advance() {
   await control('advance')
 }
+async function skipPeriod() {
+  if (busy.value || !isActivePeriod.value) return
+  if (
+    !window.confirm(
+      `Skip to ${nextPeriodName.value} with ${clock(remaining.value)} remaining? The score will be kept. A finished match still requires signatures and review.`,
+    )
+  )
+    return
+  await control('advance', { force: true })
+}
+function openEarlyFinish() {
+  if (busy.value || !isActivePeriod.value) return
+  endReason.value = ''
+  endDialog.value?.showModal()
+}
+async function finishEarly() {
+  const reason = endReason.value.trim()
+  if (!reason || reason.length > 1000 || !isActivePeriod.value) return
+  if (await control('finish_early', { reason })) endDialog.value?.close()
+}
 async function submit() {
   if (await control('submit', { signatures: signatures.value, notes: notes.value })) {
     dirtySignatures = false
@@ -297,6 +333,8 @@ watch(
     loading.value = true
     dirtySignatures = false
     setupOpen.value = false
+    endDialog.value?.close()
+    endReason.value = ''
     error.value = ''
     notice.value = ''
     await load(true)
@@ -368,11 +406,49 @@ onBeforeUnmount(() => {
             Match {{ match.number }} <span>{{ fieldName }}</span>
           </h1>
         </div>
-        <span class="phase-chip">{{ isLocked ? match.status : phaseName }}</span>
+        <span class="phase-chip">{{
+          match.is_placeholder ? 'Awaiting teams' : isLocked ? match.status : phaseName
+        }}</span>
       </header>
       <p v-if="error" class="desk-error" role="alert">{{ error }}</p>
       <p v-if="notice" class="desk-notice" role="status">{{ notice }}</p>
-      <section v-if="isLocked" class="submitted-panel">
+      <section v-if="match.is_placeholder" class="submitted-panel">
+        <h2>
+          {{
+            individualRun
+              ? 'The team has not been assigned yet'
+              : 'Teams have not been assigned yet'
+          }}
+        </h2>
+        <p>
+          This game has been reserved for scheduling. Populate its teams in Stage games before
+          opening referee control.
+        </p>
+        <RouterLink
+          :to="{
+            name: 'stage-games',
+            params: { id: match.tournament_id },
+            query: { stage: match.stage_id },
+          }"
+          class="desk-button primary"
+          >Open stage games</RouterLink
+        >
+      </section>
+      <section v-else-if="individualRun" class="submitted-panel">
+        <h2>Individual run</h2>
+        <p>
+          {{ teamName(match.team1_id) }} ·
+          {{ match.status === 'approved' ? 'Completed' : 'Scheduled without an opponent' }}
+        </p>
+        <p>
+          Manage this run from the match schedule. An editor can approve its completion in result
+          review.
+        </p>
+        <RouterLink :to="`/tournaments/${match.tournament_id}/schedule`" class="desk-button primary"
+          >Open match schedule</RouterLink
+        >
+      </section>
+      <section v-else-if="isLocked" class="submitted-panel">
         <span class="submitted-icon">✓</span>
         <h2>
           {{
@@ -592,29 +668,53 @@ onBeforeUnmount(() => {
             </button>
             <p v-else>Match complete. Confirm the result with signatures below.</p>
           </div>
+          <div v-if="isActivePeriod" class="period-actions">
+            <button v-if="!expired" :disabled="busy" @click="skipPeriod">
+              Skip to {{ nextPeriodName }} →
+            </button>
+            <button class="finish-early" :disabled="busy" @click="openEarlyFinish">
+              End match early
+            </button>
+          </div>
         </section>
         <div v-if="isHalf" class="robot-timeouts">
           <section v-for="id in teamIds" :key="id">
             <h3>{{ teamName(id) }} <span>Robot timeouts</span></h3>
             <div class="timeout-grid">
-              <button
-                v-for="robot in robots"
-                :key="robot"
-                class="timeout-button"
-                :class="{
-                  'timeout-active': !!timeout(id, robot),
-                  'timeout-expired': timeoutRemaining(id, robot) === 0,
-                }"
-                :disabled="busy"
-                @click="control('timeout', { team_id: id, robot })"
-              >
-                <strong>Robot {{ robot }}</strong
-                ><span>{{ timeoutLabel(id, robot) }}</span>
-              </button>
+              <div v-for="robot in robots" :key="robot" class="timeout-card">
+                <button
+                  class="timeout-button"
+                  :class="{
+                    'timeout-active': !!timeout(id, robot),
+                    'timeout-expired': timeoutRemaining(id, robot) === 0,
+                  }"
+                  :disabled="busy"
+                  :aria-label="`${teamName(id)}, robot ${robot}: ${timeout(id, robot) ? 'reset timeout to 1:00' : 'start 1:00 timeout'}`"
+                  @click="control('timeout', { team_id: id, robot })"
+                >
+                  <strong>Robot {{ robot }}</strong
+                  ><span>{{ timeoutLabel(id, robot) }}</span>
+                </button>
+                <div v-if="timeout(id, robot)" class="timeout-actions">
+                  <button :disabled="busy" @click="control('timeout', { team_id: id, robot })">
+                    Reset to 1:00
+                  </button>
+                  <button
+                    class="return-robot"
+                    :disabled="busy"
+                    @click="control('timeout_clear', { team_id: id, robot })"
+                  >
+                    Return to play · clear
+                  </button>
+                </div>
+              </div>
             </div>
           </section>
         </div>
         <section v-if="live.phase === 'finished'" class="signing-section">
+          <p v-if="live.ended_early" class="early-ending-note">
+            <strong>Match ended early.</strong> {{ live.end_reason }}
+          </p>
           <div class="signing-heading">
             <div>
               <h2>Accept the match result</h2>
@@ -694,12 +794,160 @@ onBeforeUnmount(() => {
           </div>
         </section>
       </div>
+      <dialog ref="endDialog" class="end-dialog" aria-labelledby="end-early-title">
+        <form @submit.prevent="finishEarly">
+          <p class="eyebrow">MATCH CONTROL</p>
+          <h2 id="end-early-title">End this match early?</h2>
+          <p>
+            The clock stops and the current score is kept. Both teams and the referees must still
+            sign before editor review.
+          </p>
+          <label
+            >Reason for ending early<textarea
+              v-model="endReason"
+              required
+              maxlength="1000"
+              rows="4"
+              placeholder="Explain why the match is ending early"
+              autofocus
+            />
+          </label>
+          <small>This reason is saved for match officials and editors.</small>
+          <p v-if="error" class="desk-error" role="alert">{{ error }}</p>
+          <div class="dialog-actions">
+            <button type="button" class="desk-button" :disabled="busy" @click="endDialog?.close()">
+              Keep playing</button
+            ><button
+              type="submit"
+              class="desk-button end-confirm"
+              :disabled="busy || !endReason.trim()"
+            >
+              {{ busy ? 'Ending…' : 'End match & collect signatures' }}
+            </button>
+          </div>
+        </form>
+      </dialog>
     </template>
     <p v-else-if="error" class="desk-error" role="alert">{{ error }}</p>
   </div>
 </template>
 
 <style scoped>
+.period-actions {
+  display: flex;
+  justify-content: center;
+  gap: 14px;
+  flex-wrap: wrap;
+  margin-top: 24px;
+  padding-top: 20px;
+  border-top: 1px solid #ffffff18;
+}
+.period-actions button {
+  background: transparent;
+  border: 1px solid #587487;
+  border-radius: 7px;
+  padding: 10px 14px;
+  color: #b7d3df;
+  font-size: 12px;
+  cursor: pointer;
+}
+.period-actions .finish-early {
+  border-color: #946a60;
+  color: #e1ad9f;
+}
+.timeout-card {
+  min-width: 0;
+  display: grid;
+  align-content: start;
+  gap: 8px;
+}
+.timeout-card > .timeout-button {
+  width: 100%;
+  min-height: 82px;
+}
+.timeout-actions {
+  display: grid;
+  gap: 6px;
+}
+.timeout-actions button {
+  cursor: pointer;
+  padding: 8px 5px;
+  border: 1px solid #d1dfe8;
+  border-radius: 6px;
+  background: #fff;
+  color: #647f91;
+  font-size: 10px;
+  min-height: 34px;
+}
+.timeout-actions .return-robot {
+  border-color: #afd9c7;
+  background: #f0faf5;
+  color: #238266;
+}
+.end-dialog {
+  border: 0;
+  border-radius: 14px;
+  padding: 28px;
+  width: min(520px, calc(100vw - 36px));
+  color: #26475c;
+  box-sizing: border-box;
+}
+.end-dialog::backdrop {
+  background: #112a41a6;
+}
+.end-dialog h2 {
+  margin: 0 0 12px;
+  font-size: 23px;
+}
+.end-dialog p:not(.eyebrow):not(.desk-error) {
+  color: #748a9a;
+  font-size: 13px;
+  line-height: 1.7;
+}
+.end-dialog label {
+  display: grid;
+  gap: 9px;
+  margin-top: 22px;
+  font-size: 12px;
+  font-weight: 700;
+}
+.end-dialog textarea {
+  border: 1px solid #cddce5;
+  border-radius: 7px;
+  padding: 12px;
+  color: #26475c;
+  font: inherit;
+  font-size: 14px;
+  resize: vertical;
+  width: 100%;
+  box-sizing: border-box;
+}
+.end-dialog small {
+  display: block;
+  color: #90a1ad;
+  font-size: 11px;
+  line-height: 1.5;
+  margin-top: 8px;
+}
+.end-dialog .dialog-actions {
+  flex-wrap: wrap;
+}
+.end-confirm {
+  background: #b6523e;
+  color: white;
+  border-color: #b6523e;
+}
+.early-ending-note {
+  background: #fff4e8;
+  color: #966125;
+  border: 1px solid #efd5ae;
+  padding: 13px 15px;
+  border-radius: 8px;
+  line-height: 1.7;
+  font-size: 12px;
+  margin: 0 0 22px;
+  overflow-wrap: anywhere;
+}
 .setup-only {
   padding: 32px;
 }
